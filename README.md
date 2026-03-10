@@ -8,6 +8,8 @@
 <img width="1024" alt="remote-opencode logo" src="./asset/remo-code-logo.png" />
 </div>
 
+> 🎤 **New in v1.4!** Voice message support — send voice messages that are automatically transcribed and processed. [See demo](#-voice-mode-demo)
+
 **remote-opencode** is a Discord bot that bridges your local [OpenCode CLI](https://github.com/sst/opencode) to Discord, enabling you to interact with your AI coding assistant remotely. Perfect for developers who want to:
 
 - 📱 **Code from mobile** — Send coding tasks from your phone while away from your desk
@@ -42,6 +44,11 @@ The bot runs on your development machine alongside OpenCode. When you send a com
 ## Demo
 
 https://github.com/user-attachments/assets/b6239cb6-234e-41e2-a4d1-d4dd3e86c7b9
+
+### 🎤 Voice Mode Demo
+
+<!-- Replace with your actual voice mode demo video link -->
+https://github.com/user-attachments/assets/YOUR_VOICE_DEMO_VIDEO_ID
 
 ---
 
