@@ -108,6 +108,7 @@ export async function runPrompt(
   let accumulatedText = '';
   let lastContent = '';
   let tick = 0;
+  let promptSent = false;
   const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   
   const updateStreamMessage = async (content: string, components: ActionRowBuilder<ButtonBuilder>[]) => {
@@ -150,10 +151,14 @@ export async function runPrompt(
     sessionManager.setSseClient(threadId, sseClient);
     
     sseClient.onPartUpdated((part) => {
+      if (part.sessionID !== sessionId) return;
       accumulatedText = part.text;
     });
     
-    sseClient.onSessionIdle(() => {
+    sseClient.onSessionIdle((idleSessionId) => {
+      if (idleSessionId !== sessionId) return;
+      if (!promptSent) return;
+      
       if (updateInterval) {
         clearInterval(updateInterval);
         updateInterval = null;
@@ -171,15 +176,14 @@ export async function runPrompt(
                 .setDisabled(true)
             );
           
-            await updateStreamMessage(
-              `${contextHeader}\n📌 **Prompt**: ${prompt}\n\n\`\`\`\n${formatted}\n\`\`\``,
-              [disabledButtons]
-            );
-            
-            await (channel as any).send({ content: '✅ Done' });
-            
-            sseClient.disconnect();
-
+          await updateStreamMessage(
+            `${contextHeader}\n📌 **Prompt**: ${prompt}\n\n\`\`\`\n${formatted}\n\`\`\``,
+            [disabledButtons]
+          );
+          
+          await (channel as any).send({ content: '✅ Done' });
+          
+          sseClient.disconnect();
           sessionManager.clearSseClient(threadId);
           
           // Trigger next in queue
@@ -235,6 +239,7 @@ export async function runPrompt(
     
     await updateStreamMessage(`${contextHeader}\n📌 **Prompt**: ${prompt}\n\n📝 Sending prompt...`, [buttons]);
     await sessionManager.sendPrompt(port, sessionId, prompt, preferredModel);
+    promptSent = true;
     
   } catch (error) {
     if (updateInterval) {
