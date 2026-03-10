@@ -47,8 +47,7 @@ https://github.com/user-attachments/assets/b6239cb6-234e-41e2-a4d1-d4dd3e86c7b9
 
 ### 🎤 Voice Mode Demo
 
-<!-- Replace with your actual voice mode demo video link -->
-https://github.com/user-attachments/assets/YOUR_VOICE_DEMO_VIDEO_ID
+https://github.com/user-attachments/assets/59cf162a-ec86-41b5-a1f3-9b1379acd9fd
 
 ---
 
