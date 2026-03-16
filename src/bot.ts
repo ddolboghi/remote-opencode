@@ -4,6 +4,7 @@ import { getBotConfig } from './services/configStore.js';
 import { handleInteraction } from './handlers/interactionHandler.js';
 import { handleMessageCreate } from './handlers/messageHandler.js';
 import * as serveManager from './services/serveManager.js';
+import { getCachedModels } from './commands/model.js';
 
 export async function startBot(): Promise<void> {
   const config = getBotConfig();
@@ -22,6 +23,8 @@ export async function startBot(): Promise<void> {
   
   client.once(Events.ClientReady, (c) => {
     console.log(pc.green(`Ready! Logged in as ${pc.bold(c.user.tag)}`));
+    // Pre-warm model cache so autocomplete never hits cold execSync
+    try { getCachedModels(); } catch { }
   });
   
   client.on(Events.InteractionCreate, handleInteraction);

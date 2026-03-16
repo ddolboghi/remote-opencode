@@ -13,11 +13,11 @@ let cachedModels: string[] = [];
 let cacheTimestamp = 0;
 const CACHE_TTL_MS = 30_000;
 
-function getCachedModels(): string[] {
+export function getCachedModels(): string[] {
   const now = Date.now();
   if (now - cacheTimestamp > CACHE_TTL_MS || cachedModels.length === 0) {
     try {
-      const output = execSync('opencode models', { encoding: 'utf-8', timeout: 5000 });
+      const output = execSync('opencode models', { encoding: 'utf-8', timeout: 2000 });
       cachedModels = output.split('\n').filter(m => m.trim());
       cacheTimestamp = now;
     } catch {

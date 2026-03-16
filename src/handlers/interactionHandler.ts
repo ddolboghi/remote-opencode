@@ -27,8 +27,12 @@ export async function handleInteraction(interaction: Interaction) {
         await command.autocomplete(interaction);
       } catch (error) {
         console.error(`Error handling autocomplete for ${interaction.commandName}:`, error);
-        if (!interaction.responded) {
-          await interaction.respond([]);
+        try {
+          if (!interaction.responded) {
+            await interaction.respond([]);
+          }
+        } catch {
+          // Interaction already expired — nothing to do
         }
       }
     }
