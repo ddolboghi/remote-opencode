@@ -72,7 +72,27 @@ export async function validateSession(port: number, sessionId: string): Promise<
   }
 }
 
-export async function listSessions(port: number): Promise<string[]> {
+export async function getSessionInfo(port: number, sessionId: string): Promise<SessionInfo | null> {
+  try {
+    const url = `http://127.0.0.1:${port}/session/${sessionId}`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return { id: data.id, title: data.title ?? '' };
+  } catch {
+    return null;
+  }
+}
+
+export interface SessionInfo {
+  id: string;
+  title: string;
+}
+
+export async function listSessions(port: number): Promise<SessionInfo[]> {
   try {
     const url = `http://127.0.0.1:${port}/session`;
     const response = await fetch(url, {
@@ -86,7 +106,10 @@ export async function listSessions(port: number): Promise<string[]> {
     
     const data = await response.json();
     if (Array.isArray(data)) {
-      return data.map((s: { id: string }) => s.id);
+      return data.map((s: { id: string; title?: string }) => ({
+        id: s.id,
+        title: s.title ?? '',
+      }));
     }
     return [];
   } catch {
