@@ -23,22 +23,15 @@
 
 ## How It Works
 
-```
-┌─────────────────┐    Discord API    ┌─────────────────┐
-│  Your Phone /   │ ◄──────────────► │  Discord Bot    │
-│  Other Device   │                   │  (this project) │
-└─────────────────┘                   └────────┬────────┘
-                                               │
-                                               ▼
-                                      ┌─────────────────┐
-                                      │  OpenCode CLI   │
-                                      │  (your machine) │
-                                      └────────┬────────┘
-                                               │
-                                               ▼
-                                      ┌─────────────────┐
-                                      │  Your Codebase  │
-                                      └─────────────────┘
+```mermaid
+flowchart LR
+    A["📱 Your Phone / Other Device"] <-->|"Discord API"| B["🤖 Discord Bot"]
+
+    subgraph Workflow
+        direction TB
+        B --> C["💻 OpenCode CLI"]
+        C --> D["📁 Your Codebase"]
+    end
 ```
 
 The bot runs on your development machine alongside OpenCode. When you send a command via Discord, it's forwarded to OpenCode, and the output streams back to you in real-time.
