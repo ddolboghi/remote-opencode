@@ -145,20 +145,7 @@ export async function runPrompt(
       sessionManager.clearSessionForThread(threadId);
     }
 
-    const existingSession = sessionManager.getSessionForThread(threadId);
-    if (existingSession && existingSession.projectPath === effectivePath) {
-      const isValid = await sessionManager.validateSession(port, existingSession.sessionId);
-      if (isValid) {
-        sessionId = existingSession.sessionId;
-        sessionManager.updateSessionLastUsed(threadId);
-      } else {
-        sessionId = await sessionManager.createSession(port);
-        sessionManager.setSessionForThread(threadId, sessionId, effectivePath, port);
-      }
-    } else {
-      sessionId = await sessionManager.createSession(port);
-      sessionManager.setSessionForThread(threadId, sessionId, effectivePath, port);
-    }
+    sessionId = await sessionManager.ensureSessionForThread(threadId, effectivePath, port);
     
     const sseClient = new SSEClient();
     sseClient.connect(`http://127.0.0.1:${port}`);

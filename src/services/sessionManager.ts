@@ -140,15 +140,32 @@ export function getSessionForThread(threadId: string): { sessionId: string; proj
 }
 
 export function setSessionForThread(threadId: string, sessionId: string, projectPath: string, port: number): void {
+  const existing = dataStore.getThreadSession(threadId);
   const now = Date.now();
   dataStore.setThreadSession({
     threadId,
     sessionId,
     projectPath,
     port,
-    createdAt: now,
+    createdAt: existing?.createdAt ?? now,
     lastUsedAt: now,
   });
+}
+
+export async function ensureSessionForThread(threadId: string, projectPath: string, port: number): Promise<string> {
+  const existingSession = getSessionForThread(threadId);
+
+  if (existingSession && existingSession.projectPath === projectPath) {
+    const isValid = await validateSession(port, existingSession.sessionId);
+    if (isValid) {
+      setSessionForThread(threadId, existingSession.sessionId, projectPath, port);
+      return existingSession.sessionId;
+    }
+  }
+
+  const sessionId = await createSession(port);
+  setSessionForThread(threadId, sessionId, projectPath, port);
+  return sessionId;
 }
 
 export function updateSessionLastUsed(threadId: string): void {

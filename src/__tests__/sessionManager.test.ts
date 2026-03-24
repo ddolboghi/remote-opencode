@@ -30,6 +30,7 @@ vi.mock('../services/dataStore.js', () => ({
 import {
   createSession,
   sendPrompt,
+  ensureSessionForThread,
   getSessionForThread,
   setSessionForThread,
   clearSessionForThread,
@@ -182,6 +183,66 @@ describe('SessionManager', () => {
       const result = getSessionForThread('thread3');
 
       expect(result).toEqual({ sessionId: 'ses_new', projectPath: '/path/to/new', port: 4003 });
+    });
+
+    it('should preserve createdAt when updating an existing thread session', () => {
+      setSessionForThread('thread4', 'ses_original', '/path/to/project', 4004);
+      const original = dataStoreMock.getThreadSession('thread4');
+
+      setSessionForThread('thread4', 'ses_original', '/path/to/project', 4005);
+
+      const updated = dataStoreMock.getThreadSession('thread4');
+      expect(updated?.createdAt).toBe(original?.createdAt);
+      expect(updated?.port).toBe(4005);
+    });
+  });
+
+  describe('ensureSessionForThread', () => {
+    it('should reuse and refresh an existing valid session', async () => {
+      setSessionForThread('thread5', 'ses_valid', '/path/to/project', 4000);
+      const original = dataStoreMock.getThreadSession('thread5');
+
+      mockFetch.mockResolvedValueOnce({ ok: true });
+
+      const sessionId = await ensureSessionForThread('thread5', '/path/to/project', 4010);
+
+      const updated = dataStoreMock.getThreadSession('thread5');
+      expect(sessionId).toBe('ses_valid');
+      expect(updated?.sessionId).toBe('ses_valid');
+      expect(updated?.port).toBe(4010);
+      expect(updated?.createdAt).toBe(original?.createdAt);
+    });
+
+    it('should create and persist a new session when the stored one is invalid', async () => {
+      setSessionForThread('thread6', 'ses_stale', '/path/to/project', 4000);
+      const original = dataStoreMock.getThreadSession('thread6');
+
+      mockFetch
+        .mockResolvedValueOnce({ ok: false, status: 404, statusText: 'Not Found' })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ id: 'ses_new' }) });
+
+      const sessionId = await ensureSessionForThread('thread6', '/path/to/project', 4011);
+
+      const updated = dataStoreMock.getThreadSession('thread6');
+      expect(sessionId).toBe('ses_new');
+      expect(updated?.sessionId).toBe('ses_new');
+      expect(updated?.port).toBe(4011);
+      expect(updated?.createdAt).toBe(original?.createdAt);
+    });
+
+    it('should create a new session when the stored project path no longer matches', async () => {
+      setSessionForThread('thread7', 'ses_old', '/path/to/old', 4000);
+
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ id: 'ses_project_new' }) });
+
+      const sessionId = await ensureSessionForThread('thread7', '/path/to/new', 4012);
+
+      const updated = dataStoreMock.getThreadSession('thread7');
+      expect(sessionId).toBe('ses_project_new');
+      expect(updated?.sessionId).toBe('ses_project_new');
+      expect(updated?.projectPath).toBe('/path/to/new');
+      expect(updated?.port).toBe(4012);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
   });
 

@@ -1,12 +1,70 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { Server } from 'node:net';
+import { delimiter, join } from 'node:path';
 import type { ServeInstance } from '../types/index.js';
 import { getPortConfig } from './configStore.js';
 
 const DEFAULT_PORT_MIN = 14097;
 const DEFAULT_PORT_MAX = 14200;
+const WINDOWS_OPENCODE_COMMANDS = ['opencode.cmd', 'opencode.exe', 'opencode'];
+const POSIX_OPENCODE_COMMANDS = ['opencode'];
 
 const instances = new Map<string, ServeInstance>();
+
+function getOpencodeCommandCandidates(): string[] {
+  return process.platform === 'win32' ? WINDOWS_OPENCODE_COMMANDS : POSIX_OPENCODE_COMMANDS;
+}
+
+function resolveCommandFromPath(command: string, pathValue?: string): string | undefined {
+  if (!pathValue) {
+    return undefined;
+  }
+
+  for (const pathEntry of pathValue.split(delimiter)) {
+    if (!pathEntry) {
+      continue;
+    }
+
+    const resolved = join(pathEntry, command);
+    if (existsSync(resolved)) {
+      return resolved;
+    }
+  }
+
+  return undefined;
+}
+
+function resolveOpencodeCommand(env: NodeJS.ProcessEnv): string {
+  const pathValue = env.PATH ?? env.Path;
+
+  for (const command of getOpencodeCommandCandidates()) {
+    const resolved = resolveCommandFromPath(command, pathValue);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return getOpencodeCommandCandidates()[0];
+}
+
+function formatSpawnError(error: Error, command: string, projectPath: string): string {
+  const spawnError = error as NodeJS.ErrnoException;
+
+  if (!existsSync(projectPath)) {
+    return `Project path does not exist or is not accessible: ${projectPath}`;
+  }
+
+  if (spawnError.code === 'ENOENT') {
+    return `OpenCode executable not found: ${command}. Ensure OpenCode is installed and available in PATH for this service.`;
+  }
+
+  if (spawnError.code === 'EACCES') {
+    return `OpenCode executable is not accessible: ${command}. Check file permissions and service user access.`;
+  }
+
+  return spawnError.message || 'Failed to spawn opencode process';
+}
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -95,15 +153,16 @@ export async function spawnServe(projectPath: string, model?: string): Promise<n
   // Note: opencode serve doesn't support --model flag
   // Model selection must happen at session/prompt level, not server startup
   const args = ['serve', '--port', port.toString()];
+  const env = { ...process.env };
+  const command = resolveOpencodeCommand(env);
   
-  console.log(`[opencode] Spawning: opencode ${args.join(' ')}`);
+  console.log(`[opencode] Spawning: ${command} ${args.join(' ')}`);
   console.log(`[opencode] Working directory: ${projectPath}`);
   
-  const child = spawn('opencode', args, {
+  const child = spawn(command, args, {
     cwd: projectPath,
-    env: { ...process.env },
+    env,
     stdio: ['inherit', 'pipe', 'pipe'],
-    shell: true,
   });
 
   const instance: ServeInstance = {
@@ -154,11 +213,12 @@ export async function spawnServe(projectPath: string, model?: string): Promise<n
   });
 
   child.on('error', (error) => {
-    console.error(`[opencode] Spawn error: ${error.message}`);
+    const formattedError = formatSpawnError(error, command, projectPath);
+    console.error(`[opencode] Spawn error: ${formattedError}`);
     const inst = instances.get(key);
     if (inst) {
       inst.exited = true;
-      inst.exitError = error.message || 'Failed to spawn opencode process';
+      inst.exitError = formattedError;
     }
   });
 

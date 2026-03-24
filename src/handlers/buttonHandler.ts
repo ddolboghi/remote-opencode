@@ -111,15 +111,7 @@ async function handleWorktreePR(interaction: ButtonInteraction, threadId: string
     const port = await serveManager.spawnServe(mapping.worktreePath, preferredModel);
     await serveManager.waitForReady(port, 30000, mapping.worktreePath, preferredModel);
 
-    let sessionId: string;
-    const existingSession = sessionManager.getSessionForThread(threadId);
-    if (existingSession) {
-      const isValid = await sessionManager.validateSession(port, existingSession.sessionId);
-      sessionId = isValid ? existingSession.sessionId : await sessionManager.createSession(port);
-    } else {
-      sessionId = await sessionManager.createSession(port);
-    }
-    sessionManager.setSessionForThread(threadId, sessionId, mapping.worktreePath, port);
+    const sessionId = await sessionManager.ensureSessionForThread(threadId, mapping.worktreePath, port);
 
     const prPrompt = `Create a pull request for the current branch. Include a clear title and description summarizing all changes.`;
     await sessionManager.sendPrompt(port, sessionId, prPrompt, preferredModel);
