@@ -4,6 +4,7 @@ import { getBotConfig } from './services/configStore.js';
 import { handleInteraction } from './handlers/interactionHandler.js';
 import { handleMessageCreate } from './handlers/messageHandler.js';
 import * as serveManager from './services/serveManager.js';
+import { clearAllPendingTimers } from './services/executionService.js';
 import { initializeProxySupport } from './services/proxySupport.js';
 import { getCachedModels } from './commands/model.js';
 
@@ -34,6 +35,9 @@ export async function startBot(): Promise<void> {
   function gracefulShutdown(signal: string) {
     console.log(pc.yellow(`\n${signal} received. Shutting down gracefully...`));
     
+    clearAllPendingTimers();
+    console.log(pc.dim('All pending timers cleared.'));
+
     serveManager.stopAll();
     console.log(pc.dim('All opencode serve instances stopped.'));
     

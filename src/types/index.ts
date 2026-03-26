@@ -44,9 +44,55 @@ export interface TextPart {
   text: string;
 }
 
+export interface VisibleTextPart extends TextPart {
+  rawText: string;
+  systemTexts: string[];
+}
+
+export interface MessagePart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: string;
+  text?: string;
+  rawText?: string;
+  systemTexts?: string[];
+  [key: string]: unknown;
+}
+
+export interface SystemTextPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  text: string;
+  rawText: string;
+}
+
+export interface BackgroundSignal {
+  sessionID: string;
+  source: 'system_reminder_background_completed';
+  text: string;
+  rawText: string;
+}
+
+export interface RawMessagePart {
+  id?: string;
+  sessionID?: string;
+  messageID?: string;
+  type?: string;
+  text?: string;
+  [key: string]: unknown;
+}
+
 export interface SSEEvent {
   type: string;
   properties: Record<string, unknown>;
+}
+
+export interface CompletionSignal {
+  sessionID: string;
+  source: 'step_finish' | 'part_step_finish';
+  event: SSEEvent;
 }
 
 export interface ServeInstance {
@@ -89,4 +135,23 @@ export interface SessionErrorInfo {
     message?: string;
     providerID?: string;
   };
+}
+
+export interface SessionStatusInfo {
+  type: 'busy' | 'idle' | 'retry';
+  attempt?: number;
+  message?: string;
+  next?: string;
+}
+
+export interface MessageInfo {
+  id: string;
+  role?: string;
+  type?: string;
+  [key: string]: unknown;
+}
+
+export interface MessageWithParts {
+  info: MessageInfo;
+  parts: MessagePart[];
 }

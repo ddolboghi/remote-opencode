@@ -63,6 +63,10 @@ function formatSpawnError(error: Error, command: string, projectPath: string): s
     return `OpenCode executable is not accessible: ${command}. Check file permissions and service user access.`;
   }
 
+  if (spawnError.code === 'EINVAL') {
+    return `Cannot execute '${command}' directly. If this is a .cmd file, ensure shell mode is enabled.`;
+  }
+
   return spawnError.message || 'Failed to spawn opencode process';
 }
 
@@ -159,10 +163,13 @@ export async function spawnServe(projectPath: string, model?: string): Promise<n
   console.log(`[opencode] Spawning: ${command} ${args.join(' ')}`);
   console.log(`[opencode] Working directory: ${projectPath}`);
   
+  const needsShell = process.platform === 'win32' && command.toLowerCase().endsWith('.cmd');
+
   const child = spawn(command, args, {
     cwd: projectPath,
     env,
-    stdio: ['inherit', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...(needsShell && { shell: true }),
   });
 
   const instance: ServeInstance = {

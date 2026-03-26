@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseSSEEvent, extractTextFromPart, accumulateText, formatOutput, stripAnsi, buildContextHeader } from '../utils/messageFormatter.js';
+import { parseSSEEvent, extractTextFromPart, accumulateText, formatOutput, formatOutputForMobile, stripAnsi, buildContextHeader } from '../utils/messageFormatter.js';
 
 describe('messageFormatter', () => {
   describe('stripAnsi', () => {
@@ -106,6 +106,31 @@ describe('messageFormatter', () => {
     it('should handle plain text with newlines', () => {
       const buffer = 'Line1\nLine2\nLine3';
       expect(formatOutput(buffer)).toBe('Line1\nLine2\nLine3');
+    });
+  });
+
+  describe('formatOutputForMobile', () => {
+    it('should apply a smaller limit to only the first chunk', () => {
+      const buffer = `${'A'.repeat(350)}\n\n${'B'.repeat(2100)}`;
+
+      const result = formatOutputForMobile(buffer, 400);
+
+      expect(result.chunks[0]?.length).toBeLessThanOrEqual(400);
+      expect(result.chunks[1]?.length).toBeLessThanOrEqual(1900);
+      expect(result.chunks.join('')).toContain('A'.repeat(100));
+      expect(result.chunks.join('')).toContain('B'.repeat(100));
+    });
+
+    it('should enforce a 1900-char limit for later chunks', () => {
+      const buffer = 'X'.repeat(4500);
+
+      const result = formatOutputForMobile(buffer, 500);
+
+      expect(result.chunks).toHaveLength(4);
+      expect(result.chunks[0]).toHaveLength(500);
+      expect(result.chunks[1]).toHaveLength(1900);
+      expect(result.chunks[2]).toHaveLength(1900);
+      expect(result.chunks[3]).toHaveLength(200);
     });
   });
 });

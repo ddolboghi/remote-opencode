@@ -99,6 +99,7 @@ export function buildContextHeader(branchName: string, modelName: string): strin
 
 export function formatOutput(buffer: string, maxLength: number = 1900): string {
   const parsed = parseOpenCodeOutput(buffer);
+  const truncationPrefix = '...(truncated)...\n\n';
   
   if (!parsed.trim()) {
     return '⏳ Processing...';
@@ -107,8 +108,13 @@ export function formatOutput(buffer: string, maxLength: number = 1900): string {
   if (parsed.length <= maxLength) {
     return parsed;
   }
-  
-  return '...(truncated)...\n\n' + parsed.slice(-maxLength);
+
+  if (maxLength <= truncationPrefix.length) {
+    return parsed.slice(-maxLength);
+  }
+
+  const availableLength = maxLength - truncationPrefix.length;
+  return truncationPrefix + parsed.slice(-availableLength);
 }
 
 export interface FormattedResult {
@@ -117,6 +123,7 @@ export interface FormattedResult {
 }
 
 const MESSAGE_MAX_LENGTH = 1900;
+const MIN_CONTENT_BUDGET = 200;
 
 /**
  * Split text into chunks that fit within Discord's message limit.
@@ -154,13 +161,36 @@ function splitIntoChunks(text: string, maxLength: number): string[] {
   return chunks;
 }
 
-export function formatOutputForMobile(buffer: string): FormattedResult {
+function splitIntoChunksWithFirstLimit(
+  text: string,
+  firstChunkMaxLength: number,
+  maxLength: number,
+): string[] {
+  if (text.length <= firstChunkMaxLength) {
+    return [text];
+  }
+
+  const firstChunk = splitIntoChunks(text, firstChunkMaxLength)[0] ?? text.slice(0, firstChunkMaxLength);
+  const remaining = text.slice(firstChunk.length).replace(/^\n+/, '');
+
+  if (!remaining) {
+    return [firstChunk];
+  }
+
+  return [firstChunk, ...splitIntoChunks(remaining, maxLength)];
+}
+
+export function formatOutputForMobile(
+  buffer: string,
+  firstChunkMaxLength: number = MESSAGE_MAX_LENGTH,
+): FormattedResult {
   const parsed = parseOpenCodeOutput(buffer);
   
   if (!parsed.trim()) {
     return { chunks: ['⏳ Processing...'] };
   }
 
-  const chunks = splitIntoChunks(parsed, MESSAGE_MAX_LENGTH);
+  const firstMax = Math.max(firstChunkMaxLength, MIN_CONTENT_BUDGET);
+  const chunks = splitIntoChunksWithFirstLimit(parsed, firstMax, MESSAGE_MAX_LENGTH);
   return { chunks };
 }

@@ -13,6 +13,39 @@ import * as worktreeManager from './worktreeManager.js';
 import { SSEClient } from './sseClient.js';
 import { formatOutput, formatOutputForMobile, buildContextHeader } from '../utils/messageFormatter.js';
 import { processNextInQueue } from './queueManager.js';
+import type { SSEEvent } from '../types/index.js';
+
+const IDLE_DEBOUNCE_MS = 3000;
+const IDLE_POLL_INTERVAL_MS = 5000;
+const MAX_IDLE_WAIT_MS = 300000; // 5 minutes max wait for background agents
+const FINAL_TEXT_SETTLE_MS = 1500;
+const MAX_UNKNOWN_BUSY_CHECKS = 3;
+const DISCORD_MESSAGE_LIMIT = 2000;
+const MIN_CONTENT_BUDGET = 200;
+const pendingTimers = new Set<NodeJS.Timeout>();
+
+type CompletionPhase =
+  | 'running'
+  | 'awaiting_confirmation'
+  | 'waiting_children'
+  | 'awaiting_parent_final'
+  | 'finalizing'
+  | 'done';
+
+function buildStatusContent(contextHeader: string, statusLine: string): string {
+  return `${contextHeader}\n\n${statusLine}`;
+}
+
+function getContentBudget(prefix: string): number {
+  return Math.max(DISCORD_MESSAGE_LIMIT - prefix.length, MIN_CONTENT_BUDGET);
+}
+
+export function clearAllPendingTimers(): void {
+  for (const timer of pendingTimers) {
+    clearTimeout(timer);
+  }
+  pendingTimers.clear();
+}
 
 export async function runPrompt(
   channel: TextBasedChannel, 
@@ -95,7 +128,7 @@ export async function runPrompt(
   let streamMessage: Message;
   try {
     streamMessage = await (channel as any).send({
-      content: `${contextHeader}\n📌 **Prompt**: ${prompt}\n\n🚀 Starting OpenCode server...`,
+      content: buildStatusContent(contextHeader, '🚀 Starting OpenCode server...'),
       components: [buttons]
     });
   } catch {
@@ -110,6 +143,27 @@ export async function runPrompt(
   let tick = 0;
   let promptSent = false;
   let hasSessionError = false;
+  let idleDebounceTimer: NodeJS.Timeout | null = null;
+  let isFinalized = false;
+  let idleStartTime: number | null = null;
+  let phase: CompletionPhase = 'running';
+  let sawBackgroundEvidence = false;
+  let sawCompletionSignal = false;
+  let backgroundBaselineMessageSignature: string | null = null;
+  let backgroundBaselineVisibleText: string | null = null;
+  let parentFinalFallbackSignature: string | null = null;
+  let parentFinalFallbackConfirmations = 0;
+  let lastVisibleTextAt: number | null = null;
+  let visibleTextRevision = 0;
+  let waitingVisibleRevision = 0;
+  let pendingVisibleTextAfterConfirmation = false;
+  let sawVisibleTextAfterConfirmation = false;
+  let unknownBusyChecks = 0;
+  let sessionBusyState: sessionManager.SessionBusyState = 'unknown';
+  const childSessionIds = new Set<string>();
+  const childSessionStates = new Map<string, sessionManager.SessionBusyState>();
+  const messageTexts = new Map<string, string>();
+  const rawEvents: SSEEvent[] = [];
   const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   
   const updateStreamMessage = async (content: string, components: ActionRowBuilder<ButtonBuilder>[]): Promise<boolean> => {
@@ -135,7 +189,7 @@ export async function runPrompt(
   try {
     port = await serveManager.spawnServe(effectivePath, preferredModel);
     
-    await updateStreamMessage(`${contextHeader}\n📌 **Prompt**: ${prompt}\n\n⏳ Waiting for OpenCode server...`, [buttons]);
+    await updateStreamMessage(buildStatusContent(contextHeader, '⏳ Waiting for OpenCode server...'), [buttons]);
     await serveManager.waitForReady(port, 30000, effectivePath, preferredModel);
     
     const settings = dataStore.getQueueSettings(threadId);
@@ -150,81 +204,590 @@ export async function runPrompt(
     const sseClient = new SSEClient();
     sseClient.connect(`http://127.0.0.1:${port}`);
     sessionManager.setSseClient(threadId, sseClient);
-    
+
+    sseClient.onRawEvent((event) => {
+      rawEvents.push(event);
+      if (rawEvents.length > 25) {
+        rawEvents.shift();
+      }
+    });
+
     sseClient.onPartUpdated((part) => {
       if (part.sessionID !== sessionId) return;
-      accumulatedText = part.text;
+      const resumedFromConfirmation = pendingVisibleTextAfterConfirmation;
+      messageTexts.set(part.messageID, part.text);
+      accumulatedText = Array.from(messageTexts.values()).join('\n\n---\n\n');
+      visibleTextRevision += 1;
+      if (resumedFromConfirmation) {
+        sawVisibleTextAfterConfirmation = true;
+        pendingVisibleTextAfterConfirmation = false;
+      }
+      lastVisibleTextAt = Date.now();
+
+      if (sawBackgroundEvidence && resumedFromConfirmation && !isFinalized) {
+        scheduleIdleCheck(FINAL_TEXT_SETTLE_MS);
+      }
+    });
+
+    sseClient.onMessagePart((part) => {
+      if (part.sessionID !== sessionId) return;
+
+      if (part.type === 'subtask' || part.type === 'agent') {
+        sawBackgroundEvidence = true;
+        void refreshChildSessions();
+        if (phase === 'awaiting_confirmation') {
+          phase = 'waiting_children';
+        }
+      }
+    });
+
+    sseClient.onBackgroundSignal((signal) => {
+      if (signal.sessionID !== sessionId) return;
+      sawBackgroundEvidence = true;
+      void refreshChildSessions();
+      if (phase === 'waiting_children' && !sawCompletionSignal) {
+        phase = 'awaiting_parent_final';
+      }
+    });
+
+    sseClient.onCompletion(async (signal) => {
+      if (signal.sessionID !== sessionId) return;
+      sawCompletionSignal = true;
+
+      if (phase === 'running' || isFinalized) {
+        return;
+      }
+      scheduleIdleCheck(0);
     });
     
-    sseClient.onSessionIdle((idleSessionId) => {
-      if (idleSessionId !== sessionId) return;
-      if (!promptSent) return;
-      
+    const finalize = async () => {
+      if (isFinalized) return;
+      isFinalized = true;
+      phase = 'done';
+      clearIdleTimer();
+
       if (updateInterval) {
         clearInterval(updateInterval);
         updateInterval = null;
       }
-      
-      (async () => {
-        try {
-          if (hasSessionError) {
-            sseClient.disconnect();
-            sessionManager.clearSseClient(threadId);
+
+      try {
+        if (hasSessionError) {
+          sseClient.disconnect();
+          sessionManager.clearSseClient(threadId);
+          return;
+        }
+
+        const disabledButtons = new ActionRowBuilder<ButtonBuilder>()
+          .addComponents(
+            new ButtonBuilder()
+              .setCustomId(`interrupt_${threadId}`)
+              .setLabel('⏸️ Interrupt')
+              .setStyle(ButtonStyle.Secondary)
+              .setDisabled(true)
+          );
+
+        if (!accumulatedText.trim()) {
+          const edited = await updateStreamMessage(
+            buildStatusContent(contextHeader, '⚠️ No output received — the model may have encountered an issue.'),
+            [disabledButtons]
+          );
+          if (!edited) {
+            await safeSend('⚠️ No output received — the model may have encountered an issue.');
+          }
+          await safeSend('⚠️ Done (no output received)');
+        } else {
+          const prefix = `${contextHeader}\n\n`;
+          const firstChunkBudget = getContentBudget(prefix);
+          const result = formatOutputForMobile(accumulatedText, firstChunkBudget);
+
+          const editSuccess = await updateStreamMessage(
+            prefix + result.chunks[0],
+            [disabledButtons]
+          );
+
+          // If edit failed (e.g., content exceeds Discord's 2000-char limit), send all chunks as new messages
+          const startIndex = editSuccess ? 1 : 0;
+          for (let i = startIndex; i < result.chunks.length; i++) {
+            await safeSend(result.chunks[i]);
+          }
+
+          await safeSend('✅ Done');
+        }
+
+        sseClient.disconnect();
+        sessionManager.clearSseClient(threadId);
+
+        await processNextInQueue(channel, threadId, parentChannelId);
+      } catch (error) {
+        console.error('Error in finalize:', error);
+        await safeSend('❌ An unexpected error occurred while processing the response.');
+      }
+    };
+
+    const splitVisibleText = (text: string): string =>
+      text
+        .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+
+    const extractVisibleTextFromParts = (parts: unknown[]): string =>
+      parts
+        .flatMap((part) => {
+          if (!part || typeof part !== 'object') {
+            return [];
+          }
+          const candidate = part as { type?: unknown; text?: unknown };
+          if (candidate.type !== 'text' || typeof candidate.text !== 'string') {
+            return [];
+          }
+          const visibleText = splitVisibleText(candidate.text);
+          return visibleText ? [visibleText] : [];
+        })
+        .join('\n\n---\n\n');
+
+    const getMessageId = (message: unknown): string | null => {
+      if (!message || typeof message !== 'object') {
+        return null;
+      }
+      const info = (message as { info?: { id?: unknown } }).info;
+      return typeof info?.id === 'string' ? info.id : null;
+    };
+
+    const getMessageSignature = (message: unknown): string | null => {
+      if (!message || typeof message !== 'object') {
+        return null;
+      }
+
+      const parts = (message as { parts?: unknown[] }).parts;
+      if (!Array.isArray(parts)) {
+        return null;
+      }
+
+      const messageId = getMessageId(message) ?? 'unknown';
+      const visibleText = extractVisibleTextFromParts(parts);
+      return JSON.stringify({ messageId, visibleText });
+    };
+
+    const isAssistantMessage = (message: unknown): boolean => {
+      if (!message || typeof message !== 'object') {
+        return false;
+      }
+
+      const info = (message as { info?: { role?: unknown; type?: unknown } }).info;
+      if (typeof info?.role === 'string') {
+        return info.role.toLowerCase() === 'assistant';
+      }
+      if (typeof info?.type === 'string') {
+        return info.type.toLowerCase() === 'assistant';
+      }
+
+      const parts = (message as { parts?: unknown[] }).parts;
+      return Array.isArray(parts) && extractVisibleTextFromParts(parts).length > 0;
+    };
+
+    const getLatestParentAssistantMessage = async (): Promise<unknown | null> => {
+      const messages = await sessionManager.getSessionMessages(port, sessionId, 20);
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (isAssistantMessage(messages[i])) {
+          return messages[i];
+        }
+      }
+      return null;
+    };
+
+    const syncAccumulatedTextFromMessage = (message: unknown): boolean => {
+      if (!message || typeof message !== 'object') {
+        return false;
+      }
+
+      const parts = (message as { parts?: unknown[] }).parts;
+      if (!Array.isArray(parts)) {
+        return false;
+      }
+
+      const visibleText = extractVisibleTextFromParts(parts);
+      if (!visibleText) {
+        return false;
+      }
+
+      const messageId = getMessageId(message) ?? `parent-final-${Date.now()}`;
+      const existingText = messageTexts.get(messageId);
+      if (
+        existingText &&
+        existingText !== visibleText &&
+        backgroundBaselineVisibleText !== null &&
+        existingText.trim() !== backgroundBaselineVisibleText.trim()
+      ) {
+        return true;
+      }
+
+      const previousText = messageTexts.get(messageId);
+      messageTexts.set(messageId, visibleText);
+      accumulatedText = Array.from(messageTexts.values()).join('\n\n---\n\n');
+
+      if (previousText !== visibleText) {
+        lastVisibleTextAt = Date.now();
+      }
+
+      return true;
+    };
+
+    const refreshChildSessions = async (): Promise<void> => {
+      const children = await sessionManager.getSessionChildren(port, sessionId);
+      const nextChildIds = new Set(children.map((child) => child.id));
+
+      childSessionIds.clear();
+      for (const childId of nextChildIds) {
+        childSessionIds.add(childId);
+      }
+
+      for (const childId of Array.from(childSessionStates.keys())) {
+        if (!childSessionIds.has(childId)) {
+          childSessionStates.delete(childId);
+        }
+      }
+
+      if (childSessionIds.size > 0) {
+        sawBackgroundEvidence = true;
+        if (backgroundBaselineMessageSignature === null) {
+          const latestParentMessage = await getLatestParentAssistantMessage();
+          backgroundBaselineMessageSignature = getMessageSignature(latestParentMessage);
+          if (latestParentMessage && typeof latestParentMessage === 'object') {
+            const parts = (latestParentMessage as { parts?: unknown[] }).parts;
+            if (Array.isArray(parts)) {
+              backgroundBaselineVisibleText = extractVisibleTextFromParts(parts);
+            }
+          }
+          if (backgroundBaselineVisibleText === null) {
+            backgroundBaselineVisibleText = accumulatedText.trim() || null;
+          }
+          parentFinalFallbackSignature = null;
+          parentFinalFallbackConfirmations = 0;
+        }
+      }
+    };
+
+    const refreshSessionStatuses = async (): Promise<void> => {
+      const statusMap = await sessionManager.getSessionStatusMap(port);
+      const parentStatus = statusMap?.[sessionId]?.type;
+      if (parentStatus === 'busy' || parentStatus === 'retry') {
+        sessionBusyState = 'busy';
+      } else if (parentStatus === 'idle') {
+        sessionBusyState = 'idle';
+      }
+
+      for (const childId of childSessionIds) {
+        const childType = statusMap?.[childId]?.type;
+        if (childType === 'busy' || childType === 'retry') {
+          childSessionStates.set(childId, 'busy');
+        } else if (childType === 'idle') {
+          childSessionStates.set(childId, 'idle');
+        } else {
+          childSessionStates.set(childId, 'unknown');
+        }
+      }
+    };
+
+    const anyChildBusy = (): boolean =>
+      Array.from(childSessionIds).some((childId) => childSessionStates.get(childId) === 'busy');
+
+    const anyChildUnknown = (): boolean =>
+      Array.from(childSessionIds).some((childId) => childSessionStates.get(childId) === 'unknown');
+
+    const markUnknownChildrenIdle = (): void => {
+      for (const childId of childSessionIds) {
+        if (childSessionStates.get(childId) === 'unknown') {
+          childSessionStates.set(childId, 'idle');
+        }
+      }
+    };
+
+    const getActivePhase = (): CompletionPhase => {
+      if (!sawBackgroundEvidence) {
+        return 'running';
+      }
+
+      if (childSessionIds.size > 0 && !anyChildBusy() && !anyChildUnknown()) {
+        return 'awaiting_parent_final';
+      }
+
+      return 'waiting_children';
+    };
+
+    const confirmLatestParentAssistantMessage = async (): Promise<boolean> => {
+      const latestParentMessage = await getLatestParentAssistantMessage();
+      if (!latestParentMessage) {
+        return false;
+      }
+
+      const latestMessageSignature = getMessageSignature(latestParentMessage);
+      const hasVisibleText = syncAccumulatedTextFromMessage(latestParentMessage);
+      if (!hasVisibleText) {
+        return false;
+      }
+
+      if (childSessionIds.size === 0) {
+        return true;
+      }
+
+      if (backgroundBaselineMessageSignature === null) {
+        backgroundBaselineMessageSignature = latestMessageSignature;
+        parentFinalFallbackSignature = null;
+        parentFinalFallbackConfirmations = 0;
+        return false;
+      }
+
+      if (
+        latestMessageSignature &&
+        latestMessageSignature !== backgroundBaselineMessageSignature
+      ) {
+        parentFinalFallbackSignature = null;
+        parentFinalFallbackConfirmations = 0;
+        return true;
+      }
+
+      const currentVisibleText = accumulatedText.trim();
+      if (
+        backgroundBaselineVisibleText !== null &&
+        currentVisibleText &&
+        currentVisibleText !== backgroundBaselineVisibleText &&
+        hasStableVisibleFinalText()
+      ) {
+        if (parentFinalFallbackSignature === currentVisibleText) {
+          parentFinalFallbackConfirmations += 1;
+        } else {
+          parentFinalFallbackSignature = currentVisibleText;
+          parentFinalFallbackConfirmations = 1;
+        }
+
+        return parentFinalFallbackConfirmations >= 2;
+      }
+
+      parentFinalFallbackSignature = null;
+      parentFinalFallbackConfirmations = 0;
+      return false;
+    };
+
+    const hasStableVisibleFinalText = (): boolean =>
+      Boolean(
+        accumulatedText.trim() &&
+        lastVisibleTextAt !== null &&
+        Date.now() - lastVisibleTextAt >= FINAL_TEXT_SETTLE_MS
+      );
+
+    const hasVisibleTextSinceConfirmation = (): boolean => visibleTextRevision > waitingVisibleRevision;
+
+    const canFinalizeFromVisibleText = (): boolean => {
+      if (!hasStableVisibleFinalText()) {
+        return false;
+      }
+
+      if (!sawBackgroundEvidence) {
+        return true;
+      }
+
+      if (childSessionIds.size === 0) {
+        return sawVisibleTextAfterConfirmation || hasVisibleTextSinceConfirmation();
+      }
+
+      return false;
+    };
+
+    const logFallbackFinalize = (reason: string): void => {
+      console.warn('[execution] Finalizing without explicit completion signal', {
+        reason,
+        sessionId,
+        rawEventTail: rawEvents.slice(-5),
+      });
+    };
+
+    // -- Idle detection with HTTP confirmation --
+    // When the session goes idle, we debounce and then confirm via HTTP
+    // that no background agents are still running before finalizing.
+
+    const clearIdleTimer = () => {
+      if (idleDebounceTimer) {
+        clearTimeout(idleDebounceTimer);
+        pendingTimers.delete(idleDebounceTimer);
+        idleDebounceTimer = null;
+      }
+    };
+
+    const resetIdleTracking = () => {
+      clearIdleTimer();
+      idleStartTime = null;
+      phase = getActivePhase();
+      unknownBusyChecks = 0;
+    };
+
+    const scheduleIdleCheck = (delay: number) => {
+      if (isFinalized) return;
+      clearIdleTimer();
+      phase =
+        childSessionIds.size > 0 && !anyChildBusy() && !anyChildUnknown()
+          ? 'awaiting_parent_final'
+          : sawBackgroundEvidence
+            ? 'waiting_children'
+            : 'awaiting_confirmation';
+
+      if (idleStartTime === null) {
+        idleStartTime = Date.now();
+        waitingVisibleRevision = visibleTextRevision;
+      }
+
+      // Safety: if we've been waiting too long, finalize regardless
+      if (idleStartTime !== null && Date.now() - idleStartTime > MAX_IDLE_WAIT_MS) {
+        void finalize();
+        return;
+      }
+
+      idleDebounceTimer = setTimeout(async () => {
+        pendingTimers.delete(idleDebounceTimer!);
+        idleDebounceTimer = null;
+
+        if (isFinalized) return;
+
+        await refreshChildSessions();
+        await refreshSessionStatuses();
+
+        const busyState =
+          sessionBusyState !== 'unknown'
+            ? sessionBusyState
+            : await sessionManager.getSessionBusyState(port, sessionId);
+        if (busyState === 'busy' && !isFinalized) {
+          unknownBusyChecks = 0;
+          scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
+          return;
+        }
+
+        if (busyState === 'unknown' && !isFinalized) {
+          unknownBusyChecks += 1;
+
+          if ((sawCompletionSignal || canFinalizeFromVisibleText()) && unknownBusyChecks >= MAX_UNKNOWN_BUSY_CHECKS) {
+            if (!sawCompletionSignal) {
+              logFallbackFinalize('stable_visible_text_after_unknown_busy_checks');
+            }
+            phase = 'finalizing';
+            await finalize();
             return;
           }
 
-          const disabledButtons = new ActionRowBuilder<ButtonBuilder>()
-            .addComponents(
-              new ButtonBuilder()
-                .setCustomId(`interrupt_${threadId}`)
-                .setLabel('⏸️ Interrupt')
-                .setStyle(ButtonStyle.Secondary)
-                .setDisabled(true)
-            );
-
-          if (!accumulatedText.trim()) {
-            const edited = await updateStreamMessage(
-              `${contextHeader}\n📌 **Prompt**: ${prompt}\n\n⚠️ No output received — the model may have encountered an issue.`,
-              [disabledButtons]
-            );
-            if (!edited) {
-              await safeSend('⚠️ No output received — the model may have encountered an issue.');
-            }
-            await safeSend('⚠️ Done (no output received)');
-          } else {
-            const result = formatOutputForMobile(accumulatedText);
-            
-            const editSuccess = await updateStreamMessage(
-              `${contextHeader}\n📌 **Prompt**: ${prompt}\n\n${result.chunks[0]}`,
-              [disabledButtons]
-            );
-            
-            // If edit failed (e.g., content exceeds Discord's 2000-char limit), send all chunks as new messages
-            const startIndex = editSuccess ? 1 : 0;
-            for (let i = startIndex; i < result.chunks.length; i++) {
-              await safeSend(result.chunks[i]);
-            }
-            
-            await safeSend('✅ Done');
-          }
-          
-          sseClient.disconnect();
-          sessionManager.clearSseClient(threadId);
-          
-          await processNextInQueue(channel, threadId, parentChannelId);
-        } catch (error) {
-          console.error('Error in onSessionIdle:', error);
-          await safeSend('❌ An unexpected error occurred while processing the response.');
+          scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
+          return;
         }
-      })();
+
+        unknownBusyChecks = 0;
+
+        if (childSessionIds.size > 0) {
+          if (anyChildBusy()) {
+            phase = 'waiting_children';
+            scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
+            return;
+          }
+
+          if (anyChildUnknown()) {
+            const hasConfirmedParentFinalMessage = await confirmLatestParentAssistantMessage();
+            if (!hasConfirmedParentFinalMessage && !isFinalized) {
+              phase = 'waiting_children';
+              scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
+              return;
+            }
+
+            // Some completed child sessions remain in /children but no longer appear
+            // in /session/status. Once the parent final message is confirmed, those
+            // missing children should stop blocking completion.
+            markUnknownChildrenIdle();
+          }
+
+          phase = 'awaiting_parent_final';
+          const hasConfirmedParentFinalMessage = await confirmLatestParentAssistantMessage();
+          if (!hasConfirmedParentFinalMessage && !isFinalized) {
+            scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
+            return;
+          }
+
+          phase = 'finalizing';
+          await finalize();
+          return;
+        }
+
+        if (!sawCompletionSignal && !canFinalizeFromVisibleText() && !isFinalized) {
+          scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
+          return;
+        }
+
+        if (!sawCompletionSignal) {
+          logFallbackFinalize('stable_visible_text_with_idle_session');
+        }
+
+        phase = 'finalizing';
+        await finalize();
+      }, delay);
+      pendingTimers.add(idleDebounceTimer);
+    };
+
+    sseClient.onSessionIdle((idleSessionId) => {
+      if (idleSessionId !== sessionId) return;
+      if (!promptSent) return;
+      if (isFinalized) return;
+
+      sessionBusyState = 'idle';
+      scheduleIdleCheck(IDLE_DEBOUNCE_MS);
+    });
+
+    sseClient.onSessionStatus((statusSessionId, status) => {
+      if (!promptSent) return;
+      if (isFinalized) return;
+
+      if (statusSessionId === sessionId) {
+        sessionBusyState = status.type === 'idle' ? 'idle' : 'busy';
+
+        if (status.type === 'busy' || status.type === 'retry') {
+          // Session resumed — cancel any pending finalization
+          resetIdleTracking();
+        }
+        return;
+      }
+
+      if (childSessionIds.has(statusSessionId)) {
+        childSessionStates.set(statusSessionId, status.type === 'idle' ? 'idle' : 'busy');
+        if (status.type === 'busy' || status.type === 'retry') {
+          sawBackgroundEvidence = true;
+          resetIdleTracking();
+        }
+      }
+    });
+
+    // Cancel idle check on any SSE activity (including tool part updates)
+    sseClient.onActivity((activitySessionId) => {
+      if (!promptSent) return;
+      if (isFinalized) return;
+      if (activitySessionId !== sessionId && !childSessionIds.has(activitySessionId)) return;
+
+      pendingVisibleTextAfterConfirmation =
+        phase === 'awaiting_confirmation' ||
+        phase === 'waiting_children' ||
+        phase === 'awaiting_parent_final';
+      if (activitySessionId === sessionId) {
+        sessionBusyState = 'busy';
+      } else {
+        sawBackgroundEvidence = true;
+        childSessionStates.set(activitySessionId, 'busy');
+      }
+      resetIdleTracking();
     });
     
     sseClient.onSessionError((errorSessionId, errorInfo) => {
       if (errorSessionId !== sessionId) return;
       if (!promptSent) return;
-      
+
       hasSessionError = true;
-      
+
+      if (idleDebounceTimer) {
+        clearIdleTimer();
+      }
+
       if (updateInterval) {
         clearInterval(updateInterval);
         updateInterval = null;
@@ -243,7 +806,7 @@ export async function runPrompt(
             );
           
           const edited = await updateStreamMessage(
-            `${contextHeader}\n📌 **Prompt**: ${prompt}\n\n❌ **Error**: ${errorMsg}`,
+            buildStatusContent(contextHeader, `❌ **Error**: ${errorMsg}`),
             [disabledButtons]
           );
           if (!edited) {
@@ -268,6 +831,10 @@ export async function runPrompt(
     });
     
     sseClient.onError((error) => {
+      if (idleDebounceTimer) {
+        clearIdleTimer();
+      }
+
       if (updateInterval) {
         clearInterval(updateInterval);
         updateInterval = null;
@@ -275,7 +842,7 @@ export async function runPrompt(
       
       (async () => {
         try {
-          const edited = await updateStreamMessage(`${contextHeader}\n📌 **Prompt**: ${prompt}\n\n❌ Connection error: ${error.message}`, []);
+          const edited = await updateStreamMessage(buildStatusContent(contextHeader, `❌ Connection error: ${error.message}`), []);
           if (!edited) {
             await safeSend(`❌ Connection error: ${error.message}`);
           }
@@ -300,14 +867,24 @@ export async function runPrompt(
     updateInterval = setInterval(async () => {
       tick++;
       try {
-        const formatted = formatOutput(accumulatedText);
         const spinnerChar = spinner[tick % spinner.length];
+        const statusLabel =
+          phase === 'waiting_children'
+            ? 'Waiting for background agents...'
+            : phase === 'awaiting_parent_final'
+              ? 'Generating final response...'
+              : phase === 'awaiting_confirmation' || phase === 'finalizing'
+              ? 'Finalizing response...'
+              : 'Running...';
+        const prefix = `${contextHeader}\n\n${spinnerChar} **${statusLabel}**\n`;
+        const formatted = formatOutput(accumulatedText, getContentBudget(prefix));
         const newContent = formatted || 'Processing...';
+        const renderedContent = prefix + newContent;
         
-        if (newContent !== lastContent || tick % 2 === 0) {
-          lastContent = newContent;
+        if (renderedContent !== lastContent || tick % 2 === 0) {
+          lastContent = renderedContent;
           await updateStreamMessage(
-            `${contextHeader}\n📌 **Prompt**: ${prompt}\n\n${spinnerChar} **Running...**\n${newContent}`,
+            renderedContent,
             [buttons]
           );
         }
@@ -316,17 +893,21 @@ export async function runPrompt(
       }
     }, 1000);
     
-    await updateStreamMessage(`${contextHeader}\n📌 **Prompt**: ${prompt}\n\n📝 Sending prompt...`, [buttons]);
+    await updateStreamMessage(buildStatusContent(contextHeader, '📝 Sending prompt...'), [buttons]);
     await sessionManager.sendPrompt(port, sessionId, prompt, preferredModel);
     promptSent = true;
     
   } catch (error) {
+    if (idleDebounceTimer) {
+      clearTimeout(idleDebounceTimer);
+      pendingTimers.delete(idleDebounceTimer);
+    }
     if (updateInterval) {
       clearInterval(updateInterval);
     }
     
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    const edited = await updateStreamMessage(`${contextHeader}\n📌 **Prompt**: ${prompt}\n\n❌ OpenCode execution failed: ${errorMessage}`, []);
+    const edited = await updateStreamMessage(buildStatusContent(contextHeader, `❌ OpenCode execution failed: ${errorMessage}`), []);
     if (!edited) {
       await safeSend(`❌ OpenCode execution failed: ${errorMessage}`);
     }

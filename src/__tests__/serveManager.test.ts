@@ -69,17 +69,22 @@ describe('serveManager', () => {
 
       expect(port).toBeGreaterThanOrEqual(14097);
       expect(port).toBeLessThanOrEqual(14200);
+      const expectedCommand = process.platform === 'win32' ? 'opencode.cmd' : 'opencode';
       expect(spawn).toHaveBeenCalledWith(
-        'opencode',
+        expectedCommand,
         ['serve', '--port', port.toString()],
         expect.objectContaining({
           cwd: projectPath,
-          stdio: ['inherit', 'pipe', 'pipe'],
+          stdio: ['ignore', 'pipe', 'pipe'],
         })
       );
 
-      const spawnOptions = vi.mocked(spawn).mock.calls[0]?.[2];
-      expect(spawnOptions).not.toHaveProperty('shell');
+      const spawnOptions = vi.mocked(spawn).mock.calls[0]?.[2] as Record<string, unknown>;
+      if (process.platform === 'win32') {
+        expect(spawnOptions.shell).toBe(true);
+      } else {
+        expect(spawnOptions).not.toHaveProperty('shell');
+      }
     });
 
     it('should resolve opencode from PATH before spawning', async () => {
@@ -130,8 +135,9 @@ describe('serveManager', () => {
       const port = await serveManager.spawnServe('/test/custom-port');
 
       expect(port).toBe(20000);
+      const expectedCommand = process.platform === 'win32' ? 'opencode.cmd' : 'opencode';
       expect(spawn).toHaveBeenCalledWith(
-        'opencode',
+        expectedCommand,
         ['serve', '--port', '20000'],
         expect.anything()
       );

@@ -31,6 +31,10 @@ import {
   createSession,
   sendPrompt,
   ensureSessionForThread,
+  getSessionBusyState,
+  getSessionChildren,
+  getSessionMessages,
+  getSessionStatusMap,
   getSessionForThread,
   setSessionForThread,
   clearSessionForThread,
@@ -243,6 +247,95 @@ describe('SessionManager', () => {
       expect(updated?.projectPath).toBe('/path/to/new');
       expect(updated?.port).toBe(4012);
       expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('getSessionBusyState', () => {
+    it('should return busy when the session status is busy', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ses_busy: { type: 'busy' } }),
+      });
+
+      await expect(getSessionBusyState(3000, 'ses_busy')).resolves.toBe('busy');
+    });
+
+    it('should return idle when the session status is not busy', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ses_idle: { type: 'idle' } }),
+      });
+
+      await expect(getSessionBusyState(3000, 'ses_idle')).resolves.toBe('idle');
+    });
+
+    it('should return unknown on request failure', async () => {
+      mockFetch.mockRejectedValueOnce(new Error('Connection refused'));
+
+      await expect(getSessionBusyState(3000, 'ses_unknown')).resolves.toBe('unknown');
+    });
+  });
+
+  describe('session topology helpers', () => {
+    it('should list child sessions for a parent session', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ([
+          { id: 'child-1', title: 'First child' },
+          { id: 'child-2' },
+        ]),
+      });
+
+      await expect(getSessionChildren(3000, 'ses_parent')).resolves.toEqual([
+        { id: 'child-1', title: 'First child' },
+        { id: 'child-2', title: '' },
+      ]);
+
+      expect(mockFetch).toHaveBeenCalledWith('http://127.0.0.1:3000/session/ses_parent/children', {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        signal: expect.any(AbortSignal),
+      });
+    });
+
+    it('should list session messages with parts', async () => {
+      const responsePayload = [
+        {
+          info: { id: 'msg-1', role: 'assistant' },
+          parts: [{ type: 'text', text: 'Hello from parent' }],
+        },
+      ];
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => responsePayload,
+      });
+
+      await expect(getSessionMessages(3000, 'ses_parent', 5)).resolves.toEqual(responsePayload);
+
+      expect(mockFetch).toHaveBeenCalledWith('http://127.0.0.1:3000/session/ses_parent/message?limit=5', {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        signal: expect.any(AbortSignal),
+      });
+    });
+
+    it('should return the full session status map', async () => {
+      const responsePayload = {
+        ses_parent: { type: 'idle' },
+        child_1: { type: 'busy', attempt: 1 },
+      };
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => responsePayload,
+      });
+
+      await expect(getSessionStatusMap(3000)).resolves.toEqual(responsePayload);
+
+      expect(mockFetch).toHaveBeenCalledWith('http://127.0.0.1:3000/session/status', {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        signal: expect.any(AbortSignal),
+      });
     });
   });
 
