@@ -38,3 +38,6 @@ coverage/
 
 # Sisyphus plans (development notes)
 .sisyphus/
+
+# omx
+.omx/
