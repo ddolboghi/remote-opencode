@@ -163,9 +163,31 @@ export async function runPrompt(
   const childSessionIds = new Set<string>();
   const childSessionStates = new Map<string, sessionManager.SessionBusyState>();
   const messageTexts = new Map<string, string>();
+  const messageRoles = new Map<string, string>();
   const rawEvents: SSEEvent[] = [];
   const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   
+  const syncAccumulatedFromLocalRoles = () => {
+    const filteredTexts = Array.from(messageTexts.entries())
+      .filter(([id]) => messageRoles.get(id) === 'assistant')
+      .map(([_, text]) => text);
+    accumulatedText = filteredTexts.join('\n\n---\n\n');
+  };
+
+  const refreshAccumulatedText = async () => {
+    try {
+      const messages = await sessionManager.getSessionMessages(port, sessionId, 20);
+      for (const msg of messages) {
+        if (msg.info?.id && msg.info?.role) {
+          messageRoles.set(msg.info.id, msg.info.role);
+        }
+      }
+    } catch {
+      // Ignore transient fetch errors
+    }
+    syncAccumulatedFromLocalRoles();
+  };
+
   const updateStreamMessage = async (content: string, components: ActionRowBuilder<ButtonBuilder>[]): Promise<boolean> => {
     try {
       await streamMessage.edit({ content, components });
@@ -216,7 +238,7 @@ export async function runPrompt(
       if (part.sessionID !== sessionId) return;
       const resumedFromConfirmation = pendingVisibleTextAfterConfirmation;
       messageTexts.set(part.messageID, part.text);
-      accumulatedText = Array.from(messageTexts.values()).join('\n\n---\n\n');
+      syncAccumulatedFromLocalRoles();
       visibleTextRevision += 1;
       if (resumedFromConfirmation) {
         sawVisibleTextAfterConfirmation = true;
@@ -286,6 +308,8 @@ export async function runPrompt(
               .setStyle(ButtonStyle.Secondary)
               .setDisabled(true)
           );
+
+        await refreshAccumulatedText();
 
         if (!accumulatedText.trim()) {
           const edited = await updateStreamMessage(
@@ -424,7 +448,7 @@ export async function runPrompt(
 
       const previousText = messageTexts.get(messageId);
       messageTexts.set(messageId, visibleText);
-      accumulatedText = Array.from(messageTexts.values()).join('\n\n---\n\n');
+      syncAccumulatedFromLocalRoles();
 
       if (previousText !== visibleText) {
         lastVisibleTextAt = Date.now();
