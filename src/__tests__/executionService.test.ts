@@ -73,6 +73,10 @@ const sseHarness = vi.hoisted(() => {
       this.sessionIdleCallback?.(sessionId);
     }
 
+    emitSessionStatus(sessionId: string, status: unknown): void {
+      this.sessionStatusCallback?.(sessionId, status);
+    }
+
     emitMessagePart(part: any): void {
       if (part?.sessionID) {
         this.activityCallback?.(part.sessionID);
@@ -94,6 +98,10 @@ const sseHarness = vi.hoisted(() => {
         text,
         rawText: text,
       });
+    }
+
+    emitSessionError(sessionId: string, error: unknown): void {
+      this.sessionErrorCallback?.(sessionId, error);
     }
 
     reset(): void {
@@ -171,7 +179,7 @@ vi.mock('../services/sseClient.js', () => ({
   SSEClient: sseHarness.MockSSEClient,
 }));
 
-import { clearAllPendingTimers, runPrompt } from '../services/executionService.js';
+import { clearAllPendingTimers, interruptActiveRun, runPrompt } from '../services/executionService.js';
 
 describe('executionService messaging and completion handling', () => {
   const prompt = 'very long prompt '.repeat(200);
@@ -275,6 +283,98 @@ describe('executionService messaging and completion handling', () => {
     expect(finalContent.length).toBeLessThanOrEqual(2000);
   });
 
+  it('finalizes when the parent status turns idle without a session.idle event', async () => {
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-status-idle',
+      text: 'Final answer from a parent idle status event',
+    });
+
+    await vi.advanceTimersByTimeAsync(1600);
+
+    client.emitSessionStatus(sessionId, { type: 'idle' });
+    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).toContain('✅ Done');
+
+    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    expect(finalEdit?.content).toContain('Final answer from a parent idle status event');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+    expect(sessionManagerMock.clearSseClient).toHaveBeenCalledWith(threadId);
+  });
+
+  it('finalizes on completion signals even when the phase is still running', async () => {
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-complete',
+      text: 'Final answer from a completion signal',
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    client.emitCompletion(sessionId);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).toContain('✅ Done');
+
+    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    expect(finalEdit?.content).toContain('Final answer from a completion signal');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+  });
+
+  it('replays a parent session error that arrives while sendPrompt is still in flight', async () => {
+    let resolveSendPrompt: (() => void) | undefined;
+    let notifySendPromptStarted: (() => void) | undefined;
+    const sendPromptStarted = new Promise<void>((resolve) => {
+      notifySendPromptStarted = resolve;
+    });
+    sessionManagerMock.sendPrompt.mockImplementation(
+      () => new Promise<void>((resolve) => {
+        notifySendPromptStarted?.();
+        resolveSendPrompt = resolve;
+      }),
+    );
+
+    const runPromise = runPrompt(channel as any, threadId, prompt, parentChannelId);
+    await sendPromptStarted;
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitSessionError(sessionId, {
+      name: 'ProviderAuthError',
+      data: { message: 'Quota exhausted' },
+    });
+
+    resolveSendPrompt?.();
+    await runPromise;
+    await vi.advanceTimersByTimeAsync(0);
+
+    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    expect(finalEdit?.content).toContain('Quota exhausted');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+    expect(sessionManagerMock.clearSseClient).toHaveBeenCalledWith(threadId);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).toContain('❌ Execution failed. Queue cleared. Use `/queue settings` to change this behavior.');
+  });
+
   it('falls back to sending all final chunks when the final edit fails', async () => {
     streamEdit.mockImplementation(async (payload: { content: string }) => {
       const { content } = payload;
@@ -321,6 +421,11 @@ describe('executionService messaging and completion handling', () => {
     expect(fallbackChunks.every(content => content.length <= 2000)).toBe(true);
     expect(fallbackChunks.every(content => !content.includes(prompt))).toBe(true);
     expect(sentContents).toContain('✅ Done');
+
+    const cleanupEdit = streamEdit.mock.calls.find(([payload]) =>
+      typeof payload.content === 'string' && payload.content.includes('Output continued below.'),
+    )?.[0];
+    expect(cleanupEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
 
   it('shows finalizing response while confirming completion if no background evidence has been observed', async () => {
@@ -821,5 +926,98 @@ describe('executionService messaging and completion handling', () => {
       .map(([payload]) => payload.content as string);
 
     expect(sentContents).toContain('✅ Done');
+  });
+
+  it('treats child session errors as terminal so they no longer block completion forever', async () => {
+    sessionManagerMock.getSessionChildren.mockResolvedValue([
+      { id: 'child-1', title: 'Background child' },
+    ]);
+    sessionManagerMock.getSessionStatusMap.mockResolvedValue({
+      [sessionId]: { type: 'idle' },
+      'child-1': { type: 'busy' },
+    });
+    sessionManagerMock.getSessionMessages
+      .mockResolvedValueOnce([
+        {
+          info: { id: 'msg-parent', role: 'assistant' },
+          parts: [{ type: 'text', text: 'Interim parent text before child failure' }],
+        },
+      ])
+      .mockResolvedValue([
+        {
+          info: { id: 'msg-parent', role: 'assistant' },
+          parts: [{ type: 'text', text: 'Final answer after child failure' }],
+        },
+      ]);
+
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitMessagePart({
+      type: 'subtask',
+      sessionID: sessionId,
+      id: 'part-child-error',
+      messageID: 'msg-parent',
+      prompt: 'Investigate API behavior',
+      description: 'Background worker',
+      agent: 'general',
+    });
+
+    await Promise.resolve();
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-parent',
+      text: 'Final answer after child failure',
+    });
+
+    await vi.advanceTimersByTimeAsync(1600);
+
+    client.emitSessionError('child-1', {
+      name: 'UnknownError',
+      data: { message: 'Background worker failed' },
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).toContain('✅ Done');
+
+    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    expect(finalEdit?.content).toContain('Final answer after child failure');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+  });
+
+  it('forces the visible stream message into an interrupted terminal state', async () => {
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-interrupt',
+      text: 'Still running before interrupt',
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const interrupted = await interruptActiveRun(threadId);
+    expect(interrupted).toBe(true);
+
+    const editCountAfterInterrupt = streamEdit.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(streamEdit).toHaveBeenCalledTimes(editCountAfterInterrupt);
+    expect(client.disconnect).toHaveBeenCalledTimes(1);
+    expect(sessionManagerMock.clearSseClient).toHaveBeenCalledWith(threadId);
+
+    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    expect(finalEdit?.content).toContain('⏹️ Interrupted.');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
 });

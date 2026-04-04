@@ -3,6 +3,7 @@ import * as sessionManager from '../services/sessionManager.js';
 import * as serveManager from '../services/serveManager.js';
 import * as dataStore from '../services/dataStore.js';
 import * as worktreeManager from '../services/worktreeManager.js';
+import { interruptActiveRun } from '../services/executionService.js';
 
 export async function handleButton(interaction: ButtonInteraction) {
   const customId = interaction.customId;
@@ -61,6 +62,7 @@ async function handleInterrupt(interaction: ButtonInteraction, threadId: string)
   const success = await sessionManager.abortSession(port, session.sessionId);
   
   if (success) {
+    await interruptActiveRun(threadId);
     await interaction.editReply({ content: '⏸️ Interrupt request sent.' });
   } else {
     await interaction.editReply({ content: '⚠️ Failed to interrupt. Server may not be running or no active task.' });

@@ -13,7 +13,7 @@ import * as worktreeManager from './worktreeManager.js';
 import { SSEClient } from './sseClient.js';
 import { formatOutput, formatOutputForMobile, buildContextHeader } from '../utils/messageFormatter.js';
 import { processNextInQueue } from './queueManager.js';
-import type { SSEEvent } from '../types/index.js';
+import type { SSEEvent, SessionErrorInfo } from '../types/index.js';
 
 const IDLE_DEBOUNCE_MS = 3000;
 const IDLE_POLL_INTERVAL_MS = 5000;
@@ -23,6 +23,7 @@ const MAX_UNKNOWN_BUSY_CHECKS = 3;
 const DISCORD_MESSAGE_LIMIT = 2000;
 const MIN_CONTENT_BUDGET = 200;
 const pendingTimers = new Set<NodeJS.Timeout>();
+const activeRunInterruptHandlers = new Map<string, () => Promise<boolean>>();
 
 type CompletionPhase =
   | 'running'
@@ -40,11 +41,31 @@ function getContentBudget(prefix: string): number {
   return Math.max(DISCORD_MESSAGE_LIMIT - prefix.length, MIN_CONTENT_BUDGET);
 }
 
+function buildInterruptRow(threadId: string, disabled: boolean): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>()
+    .addComponents(
+      new ButtonBuilder()
+        .setCustomId(`interrupt_${threadId}`)
+        .setLabel('⏸️ Interrupt')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled)
+    );
+}
+
 export function clearAllPendingTimers(): void {
   for (const timer of pendingTimers) {
     clearTimeout(timer);
   }
   pendingTimers.clear();
+}
+
+export async function interruptActiveRun(threadId: string): Promise<boolean> {
+  const handler = activeRunInterruptHandlers.get(threadId);
+  if (!handler) {
+    return false;
+  }
+
+  return handler();
 }
 
 export async function runPrompt(
@@ -117,13 +138,7 @@ export async function runPrompt(
   const branchName = worktreeMapping?.branchName ?? await worktreeManager.getCurrentBranch(effectivePath) ?? 'main';
   const contextHeader = buildContextHeader(branchName, modelDisplay);
   
-  const buttons = new ActionRowBuilder<ButtonBuilder>()
-    .addComponents(
-      new ButtonBuilder()
-        .setCustomId(`interrupt_${threadId}`)
-        .setLabel('⏸️ Interrupt')
-        .setStyle(ButtonStyle.Secondary)
-    );
+  const buttons = buildInterruptRow(threadId, false);
   
   let streamMessage: Message;
   try {
@@ -142,11 +157,13 @@ export async function runPrompt(
   let lastContent = '';
   let tick = 0;
   let promptSent = false;
+  let isSendingPrompt = false;
   let hasSessionError = false;
   let idleDebounceTimer: NodeJS.Timeout | null = null;
   let isFinalized = false;
   let idleStartTime: number | null = null;
   let phase: CompletionPhase = 'running';
+  let activeSseClient: SSEClient | null = null;
   let sawBackgroundEvidence = false;
   let sawCompletionSignal = false;
   let backgroundBaselineMessageSignature: string | null = null;
@@ -161,10 +178,22 @@ export async function runPrompt(
   let unknownBusyChecks = 0;
   let sessionBusyState: sessionManager.SessionBusyState = 'unknown';
   const childSessionIds = new Set<string>();
+  const childTerminalSessionIds = new Set<string>();
   const childSessionStates = new Map<string, sessionManager.SessionBusyState>();
   const messageTexts = new Map<string, string>();
   const messageRoles = new Map<string, string>();
   const rawEvents: SSEEvent[] = [];
+  const bufferedParentSignals: {
+    sawIdleEvent: boolean;
+    sawIdleStatus: boolean;
+    sawCompletion: boolean;
+    error: SessionErrorInfo | null;
+  } = {
+    sawIdleEvent: false,
+    sawIdleStatus: false,
+    sawCompletion: false,
+    error: null,
+  };
   const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   
   const syncAccumulatedFromLocalRoles = () => {
@@ -207,12 +236,106 @@ export async function runPrompt(
       return false;
     }
   };
+
+  const clearBufferedParentSignals = (): void => {
+    bufferedParentSignals.sawIdleEvent = false;
+    bufferedParentSignals.sawIdleStatus = false;
+    bufferedParentSignals.sawCompletion = false;
+    bufferedParentSignals.error = null;
+  };
+
+  const tryBufferParentSignal = (signal: 'idle' | 'idle_status' | 'completion' | 'error', errorInfo?: SessionErrorInfo): boolean => {
+    if (!isSendingPrompt || isFinalized) {
+      return false;
+    }
+
+    if (signal === 'idle') {
+      bufferedParentSignals.sawIdleEvent = true;
+    } else if (signal === 'idle_status') {
+      bufferedParentSignals.sawIdleStatus = true;
+    } else if (signal === 'completion') {
+      bufferedParentSignals.sawCompletion = true;
+    } else if (signal === 'error' && errorInfo) {
+      bufferedParentSignals.error = errorInfo;
+    }
+
+    return true;
+  };
+
+  const clearRuntimeArtifacts = (): void => {
+    activeRunInterruptHandlers.delete(threadId);
+
+    if (idleDebounceTimer) {
+      clearTimeout(idleDebounceTimer);
+      pendingTimers.delete(idleDebounceTimer);
+      idleDebounceTimer = null;
+    }
+
+    if (updateInterval) {
+      clearInterval(updateInterval);
+      updateInterval = null;
+    }
+  };
+
+  const disconnectActiveSseClient = (): void => {
+    activeSseClient?.disconnect();
+    activeSseClient = null;
+    sessionManager.clearSseClient(threadId);
+  };
+
+  const settleTerminalStreamMessage = async (content: string, fallbackStatusLine: string): Promise<boolean> => {
+    const disabledButtons = [buildInterruptRow(threadId, true)];
+    const edited = await updateStreamMessage(content, disabledButtons);
+    if (edited) {
+      return true;
+    }
+
+    try {
+      await streamMessage.edit({
+        content: buildStatusContent(contextHeader, fallbackStatusLine),
+        components: disabledButtons,
+      });
+    } catch (error) {
+      console.error(
+        'Failed to settle stream message after terminal edit failure:',
+        error instanceof Error ? error.message : error,
+      );
+    }
+
+    return false;
+  };
+
+  const finalizeInterruptedRun = async (): Promise<boolean> => {
+    if (isFinalized) {
+      return true;
+    }
+
+    isFinalized = true;
+    phase = 'done';
+    clearRuntimeArtifacts();
+
+    const settledOriginalMessage = await settleTerminalStreamMessage(
+      buildStatusContent(contextHeader, '⏹️ Interrupted.'),
+      '⏹️ Interrupted.',
+    );
+    if (!settledOriginalMessage) {
+      await safeSend('⏹️ Interrupted.');
+    }
+
+    disconnectActiveSseClient();
+    await processNextInQueue(channel, threadId, parentChannelId);
+    return true;
+  };
+
+  activeRunInterruptHandlers.set(threadId, finalizeInterruptedRun);
   
   try {
     port = await serveManager.spawnServe(effectivePath, preferredModel);
+    if (isFinalized) return;
     
     await updateStreamMessage(buildStatusContent(contextHeader, '⏳ Waiting for OpenCode server...'), [buttons]);
     await serveManager.waitForReady(port, 30000, effectivePath, preferredModel);
+    if (isFinalized) return;
     
     const settings = dataStore.getQueueSettings(threadId);
     
@@ -222,8 +345,10 @@ export async function runPrompt(
     }
 
     sessionId = await sessionManager.ensureSessionForThread(threadId, effectivePath, port);
+    if (isFinalized) return;
     
     const sseClient = new SSEClient();
+    activeSseClient = sseClient;
     sseClient.connect(`http://127.0.0.1:${port}`);
     sessionManager.setSseClient(threadId, sseClient);
 
@@ -237,6 +362,9 @@ export async function runPrompt(
     sseClient.onPartUpdated((part) => {
       if (part.sessionID !== sessionId) return;
       const resumedFromConfirmation = pendingVisibleTextAfterConfirmation;
+      if (!messageRoles.has(part.messageID)) {
+        messageRoles.set(part.messageID, 'assistant');
+      }
       messageTexts.set(part.messageID, part.text);
       syncAccumulatedFromLocalRoles();
       visibleTextRevision += 1;
@@ -274,11 +402,16 @@ export async function runPrompt(
 
     sseClient.onCompletion(async (signal) => {
       if (signal.sessionID !== sessionId) return;
-      sawCompletionSignal = true;
-
-      if (phase === 'running' || isFinalized) {
+      if (!promptSent) {
+        tryBufferParentSignal('completion');
         return;
       }
+
+      sawCompletionSignal = true;
+      if (isFinalized) {
+        return;
+      }
+
       scheduleIdleCheck(0);
     });
     
@@ -286,35 +419,20 @@ export async function runPrompt(
       if (isFinalized) return;
       isFinalized = true;
       phase = 'done';
-      clearIdleTimer();
-
-      if (updateInterval) {
-        clearInterval(updateInterval);
-        updateInterval = null;
-      }
+      clearRuntimeArtifacts();
 
       try {
         if (hasSessionError) {
-          sseClient.disconnect();
-          sessionManager.clearSseClient(threadId);
+          disconnectActiveSseClient();
           return;
         }
-
-        const disabledButtons = new ActionRowBuilder<ButtonBuilder>()
-          .addComponents(
-            new ButtonBuilder()
-              .setCustomId(`interrupt_${threadId}`)
-              .setLabel('⏸️ Interrupt')
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(true)
-          );
 
         await refreshAccumulatedText();
 
         if (!accumulatedText.trim()) {
-          const edited = await updateStreamMessage(
+          const edited = await settleTerminalStreamMessage(
             buildStatusContent(contextHeader, '⚠️ No output received — the model may have encountered an issue.'),
-            [disabledButtons]
+            '⚠️ No output received — see follow-up message.'
           );
           if (!edited) {
             await safeSend('⚠️ No output received — the model may have encountered an issue.');
@@ -325,9 +443,9 @@ export async function runPrompt(
           const firstChunkBudget = getContentBudget(prefix);
           const result = formatOutputForMobile(accumulatedText, firstChunkBudget);
 
-          const editSuccess = await updateStreamMessage(
+          const editSuccess = await settleTerminalStreamMessage(
             prefix + result.chunks[0],
-            [disabledButtons]
+            result.chunks.length > 1 ? '✅ Output continued below.' : '✅ Done'
           );
 
           // If edit failed (e.g., content exceeds Discord's 2000-char limit), send all chunks as new messages
@@ -339,8 +457,7 @@ export async function runPrompt(
           await safeSend('✅ Done');
         }
 
-        sseClient.disconnect();
-        sessionManager.clearSseClient(threadId);
+        disconnectActiveSseClient();
 
         await processNextInQueue(channel, threadId, parentChannelId);
       } catch (error) {
@@ -469,6 +586,7 @@ export async function runPrompt(
       for (const childId of Array.from(childSessionStates.keys())) {
         if (!childSessionIds.has(childId)) {
           childSessionStates.delete(childId);
+          childTerminalSessionIds.delete(childId);
         }
       }
 
@@ -502,6 +620,11 @@ export async function runPrompt(
       }
 
       for (const childId of childSessionIds) {
+        if (childTerminalSessionIds.has(childId)) {
+          childSessionStates.set(childId, 'idle');
+          continue;
+        }
+
         const childType = statusMap?.[childId]?.type;
         if (childType === 'busy' || childType === 'retry') {
           childSessionStates.set(childId, 'busy');
@@ -751,9 +874,76 @@ export async function runPrompt(
       pendingTimers.add(idleDebounceTimer);
     };
 
+    const handleParentSessionError = async (errorInfo: SessionErrorInfo): Promise<void> => {
+      if (isFinalized) {
+        return;
+      }
+
+      hasSessionError = true;
+      isFinalized = true;
+      phase = 'done';
+      clearRuntimeArtifacts();
+
+      try {
+        const errorMsg = errorInfo.data?.message || errorInfo.name || 'Unknown error';
+        const edited = await settleTerminalStreamMessage(
+          buildStatusContent(contextHeader, `❌ **Error**: ${errorMsg}`),
+          '❌ Error — see follow-up message.',
+        );
+        if (!edited) {
+          await safeSend(`❌ **Error**: ${errorMsg}`);
+        }
+
+        disconnectActiveSseClient();
+
+        const settings = dataStore.getQueueSettings(threadId);
+        if (settings.continueOnFailure) {
+          await processNextInQueue(channel, threadId, parentChannelId);
+        } else {
+          dataStore.clearQueue(threadId);
+          await safeSend('❌ Execution failed. Queue cleared. Use `/queue settings` to change this behavior.');
+        }
+      } catch (error) {
+        console.error('Error in onSessionError:', error);
+        await safeSend('❌ An unexpected error occurred while handling a session error.');
+      }
+    };
+
+    const replayBufferedParentSignals = async (): Promise<void> => {
+      if (isFinalized) {
+        clearBufferedParentSignals();
+        return;
+      }
+
+      const bufferedError = bufferedParentSignals.error;
+      const sawIdleSignal = bufferedParentSignals.sawIdleEvent || bufferedParentSignals.sawIdleStatus;
+      const sawBufferedCompletion = bufferedParentSignals.sawCompletion;
+      clearBufferedParentSignals();
+
+      if (bufferedError) {
+        await handleParentSessionError(bufferedError);
+        return;
+      }
+
+      if (sawBufferedCompletion) {
+        sawCompletionSignal = true;
+      }
+
+      if (sawIdleSignal) {
+        sessionBusyState = 'idle';
+      }
+
+      if (sawIdleSignal || sawBufferedCompletion) {
+        scheduleIdleCheck(sawBufferedCompletion ? 0 : IDLE_DEBOUNCE_MS);
+      }
+    };
+
     sseClient.onSessionIdle((idleSessionId) => {
       if (idleSessionId !== sessionId) return;
-      if (!promptSent) return;
+      if (!promptSent) {
+        tryBufferParentSignal('idle');
+        return;
+      }
       if (isFinalized) return;
 
       sessionBusyState = 'idle';
@@ -761,20 +951,35 @@ export async function runPrompt(
     });
 
     sseClient.onSessionStatus((statusSessionId, status) => {
-      if (!promptSent) return;
       if (isFinalized) return;
 
       if (statusSessionId === sessionId) {
+        if (!promptSent) {
+          if (status.type === 'idle') {
+            tryBufferParentSignal('idle_status');
+          }
+          return;
+        }
+
         sessionBusyState = status.type === 'idle' ? 'idle' : 'busy';
 
         if (status.type === 'busy' || status.type === 'retry') {
           // Session resumed — cancel any pending finalization
           resetIdleTracking();
+          return;
         }
+
+        scheduleIdleCheck(IDLE_DEBOUNCE_MS);
         return;
       }
 
+      if (!promptSent) return;
+
       if (childSessionIds.has(statusSessionId)) {
+        if (status.type === 'busy' || status.type === 'retry') {
+          childTerminalSessionIds.delete(statusSessionId);
+        }
+
         childSessionStates.set(statusSessionId, status.type === 'idle' ? 'idle' : 'busy');
         if (status.type === 'busy' || status.type === 'retry') {
           sawBackgroundEvidence = true;
@@ -803,76 +1008,47 @@ export async function runPrompt(
     });
     
     sseClient.onSessionError((errorSessionId, errorInfo) => {
-      if (errorSessionId !== sessionId) return;
-      if (!promptSent) return;
-
-      hasSessionError = true;
-
-      if (idleDebounceTimer) {
-        clearIdleTimer();
-      }
-
-      if (updateInterval) {
-        clearInterval(updateInterval);
-        updateInterval = null;
-      }
-      
-      (async () => {
-        try {
-          const errorMsg = errorInfo.data?.message || errorInfo.name || 'Unknown error';
-          const disabledButtons = new ActionRowBuilder<ButtonBuilder>()
-            .addComponents(
-              new ButtonBuilder()
-                .setCustomId(`interrupt_${threadId}`)
-                .setLabel('⏸️ Interrupt')
-                .setStyle(ButtonStyle.Secondary)
-                .setDisabled(true)
-            );
-          
-          const edited = await updateStreamMessage(
-            buildStatusContent(contextHeader, `❌ **Error**: ${errorMsg}`),
-            [disabledButtons]
-          );
-          if (!edited) {
-            await safeSend(`❌ **Error**: ${errorMsg}`);
-          }
-          
-          sseClient.disconnect();
-          sessionManager.clearSseClient(threadId);
-          
-          const settings = dataStore.getQueueSettings(threadId);
-          if (settings.continueOnFailure) {
-            await processNextInQueue(channel, threadId, parentChannelId);
-          } else {
-            dataStore.clearQueue(threadId);
-            await safeSend('❌ Execution failed. Queue cleared. Use `/queue settings` to change this behavior.');
-          }
-        } catch (error) {
-          console.error('Error in onSessionError:', error);
-          await safeSend('❌ An unexpected error occurred while handling a session error.');
+      if (errorSessionId === sessionId) {
+        if (!promptSent) {
+          tryBufferParentSignal('error', errorInfo);
+          return;
         }
-      })();
+
+        void handleParentSessionError(errorInfo);
+        return;
+      }
+
+      if (!promptSent || isFinalized) {
+        return;
+      }
+
+      if (childSessionIds.has(errorSessionId) || childSessionStates.has(errorSessionId)) {
+        childTerminalSessionIds.add(errorSessionId);
+        childSessionStates.set(errorSessionId, 'idle');
+        scheduleIdleCheck(0);
+      }
     });
     
     sseClient.onError((error) => {
-      if (idleDebounceTimer) {
-        clearIdleTimer();
+      if (isFinalized) {
+        return;
       }
 
-      if (updateInterval) {
-        clearInterval(updateInterval);
-        updateInterval = null;
-      }
+      isFinalized = true;
+      phase = 'done';
+      clearRuntimeArtifacts();
       
       (async () => {
         try {
-          const edited = await updateStreamMessage(buildStatusContent(contextHeader, `❌ Connection error: ${error.message}`), []);
+          const edited = await settleTerminalStreamMessage(
+            buildStatusContent(contextHeader, `❌ Connection error: ${error.message}`),
+            '❌ Connection error — see follow-up message.',
+          );
           if (!edited) {
             await safeSend(`❌ Connection error: ${error.message}`);
           }
-          
-          sseClient.disconnect();
-          sessionManager.clearSseClient(threadId);
+
+          disconnectActiveSseClient();
           
           const settings = dataStore.getQueueSettings(threadId);
           if (settings.continueOnFailure) {
@@ -918,29 +1094,33 @@ export async function runPrompt(
     }, 1000);
     
     await updateStreamMessage(buildStatusContent(contextHeader, '📝 Sending prompt...'), [buttons]);
+    isSendingPrompt = true;
+    clearBufferedParentSignals();
     await sessionManager.sendPrompt(port, sessionId, prompt, preferredModel);
+    isSendingPrompt = false;
+    if (isFinalized) return;
     promptSent = true;
+    await replayBufferedParentSignals();
     
   } catch (error) {
-    if (idleDebounceTimer) {
-      clearTimeout(idleDebounceTimer);
-      pendingTimers.delete(idleDebounceTimer);
+    isSendingPrompt = false;
+
+    if (isFinalized) {
+      return;
     }
-    if (updateInterval) {
-      clearInterval(updateInterval);
-    }
+
+    clearRuntimeArtifacts();
     
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    const edited = await updateStreamMessage(buildStatusContent(contextHeader, `❌ OpenCode execution failed: ${errorMessage}`), []);
+    const edited = await settleTerminalStreamMessage(
+      buildStatusContent(contextHeader, `❌ OpenCode execution failed: ${errorMessage}`),
+      '❌ OpenCode execution failed — see follow-up message.',
+    );
     if (!edited) {
       await safeSend(`❌ OpenCode execution failed: ${errorMessage}`);
     }
-    
-    const client = sessionManager.getSseClient(threadId);
-    if (client) {
-      client.disconnect();
-      sessionManager.clearSseClient(threadId);
-    }
+
+    disconnectActiveSseClient();
     
     const settings = dataStore.getQueueSettings(threadId);
     if (settings.continueOnFailure) {
