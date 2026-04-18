@@ -314,7 +314,7 @@ describe('executionService messaging and completion handling', () => {
     const runningContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
     expect(editContentsAfterStreaming.some((content) => content.includes('Running...'))).toBe(true);
     expect(runningContent).not.toContain(prompt);
-    expect(runningContent).not.toContain('A'.repeat(200));
+    expect(runningContent).toContain('A'.repeat(200));
     expect(runningContent.length).toBeLessThanOrEqual(2000);
 
     client.emitSessionIdle(sessionId);
@@ -329,7 +329,7 @@ describe('executionService messaging and completion handling', () => {
     expect(finalContent.length).toBeLessThanOrEqual(2000);
   });
 
-  it('keeps the active representative message status-oriented instead of repainting streamed transcript text', async () => {
+  it('shows a live transcript preview in the active representative message before completion', async () => {
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
     const client = sseHarness.MockSSEClient.instances[0];
@@ -345,9 +345,13 @@ describe('executionService messaging and completion handling', () => {
     await vi.advanceTimersByTimeAsync(2000);
 
     const editContents = streamEdit.mock.calls.map(([payload]) => payload.content as string);
-    expect(streamEdit.mock.calls.length).toBe(editCountBeforeStreaming);
+    expect(streamEdit.mock.calls.length).toBeGreaterThan(editCountBeforeStreaming);
     expect(editContents.some((content) => content.includes('Running...'))).toBe(true);
-    expect(editContents.some((content) => content.includes('Live transcript body'))).toBe(false);
+    expect(editContents.some((content) => content.includes('Live transcript body'))).toBe(true);
+
+    const activePreview = getLastStreamEditPayload(streamEdit)?.content ?? '';
+    expect(activePreview).toContain('Running...');
+    expect(activePreview).toContain('Live transcript body');
 
     client.emitSessionIdle(sessionId);
     await vi.advanceTimersByTimeAsync(3000);
@@ -1160,6 +1164,38 @@ describe('executionService messaging and completion handling', () => {
       .map(([payload]) => payload.content as string);
 
     expect(sentContents).toContain('✅ Done');
+  });
+
+  it('re-checks a stale busy cache against live session state before deciding to stay running', async () => {
+    sessionManagerMock.getSessionStatusMap.mockReset();
+    sessionManagerMock.getSessionStatusMap.mockResolvedValue({});
+    sessionManagerMock.getSessionBusyState.mockReset();
+    sessionManagerMock.getSessionBusyState.mockResolvedValue('idle');
+
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitSessionStatus(sessionId, { type: 'busy' });
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-stale-busy',
+      text: 'Final answer after stale busy cache',
+    });
+
+    await vi.advanceTimersByTimeAsync(1600);
+
+    client.emitCompletion(sessionId);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).toContain('✅ Done');
+
+    const finalEdit = getLastStreamEditPayload(streamEdit);
+    expect(finalEdit?.content).toContain('Final answer after stale busy cache');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
 
   it('treats child session errors as terminal so they no longer block completion forever', async () => {

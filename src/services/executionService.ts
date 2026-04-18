@@ -20,6 +20,7 @@ const IDLE_POLL_INTERVAL_MS = 5000;
 const MAX_IDLE_WAIT_MS = 300000; // 5 minutes max wait for background agents
 const FINAL_TEXT_SETTLE_MS = 1500;
 const MAX_UNKNOWN_BUSY_CHECKS = 3;
+const LIVE_PREVIEW_DEBOUNCE_MS = 400;
 const DISCORD_MESSAGE_LIMIT = 2000;
 const MIN_CONTENT_BUDGET = 200;
 const pendingTimers = new Set<NodeJS.Timeout>();
@@ -166,6 +167,7 @@ export async function runPrompt(
   let isSendingPrompt = false;
   let hasSessionError = false;
   let idleDebounceTimer: NodeJS.Timeout | null = null;
+  let livePreviewTimer: NodeJS.Timeout | null = null;
   let isFinalized = false;
   let idleStartTime: number | null = null;
   let phase: CompletionPhase = 'running';
@@ -299,7 +301,67 @@ export async function runPrompt(
     }
   };
 
+  const buildLivePreviewBody = (): string | undefined => {
+    const visibleText = accumulatedText.trim();
+    if (!visibleText) {
+      return undefined;
+    }
+
+    const previewPrefix = '…\n';
+    const previewBudget = getContentBudget(`${contextHeader}\n\n${getActiveStatusLine()}\n\n${previewPrefix}`);
+    if (visibleText.length <= previewBudget) {
+      return visibleText;
+    }
+
+    return `${previewPrefix}${visibleText.slice(-(previewBudget - previewPrefix.length))}`;
+  };
+
+  const renderRepresentativePreview = async (): Promise<void> => {
+    if (isFinalized) {
+      return;
+    }
+
+    const content = buildTerminalContent(
+      contextHeader,
+      getActiveStatusLine(),
+      buildLivePreviewBody(),
+    );
+
+    if (content === lastContent) {
+      return;
+    }
+
+    const edited = await updateStreamMessage(content, [buttons]);
+    if (edited) {
+      lastContent = content;
+    }
+  };
+
+  const scheduleLivePreviewRender = (): void => {
+    if (isFinalized || hasSessionError) {
+      return;
+    }
+
+    if (livePreviewTimer) {
+      clearTimeout(livePreviewTimer);
+      pendingTimers.delete(livePreviewTimer);
+    }
+
+    livePreviewTimer = setTimeout(() => {
+      pendingTimers.delete(livePreviewTimer!);
+      livePreviewTimer = null;
+      void renderRepresentativePreview();
+    }, LIVE_PREVIEW_DEBOUNCE_MS);
+
+    pendingTimers.add(livePreviewTimer);
+  };
+
   const renderActiveRepresentative = async (): Promise<void> => {
+    if (accumulatedText.trim()) {
+      await renderRepresentativePreview();
+      return;
+    }
+
     await renderRepresentativeStatus(getActiveStatusLine());
   };
 
@@ -321,6 +383,12 @@ export async function runPrompt(
       clearTimeout(idleDebounceTimer);
       pendingTimers.delete(idleDebounceTimer);
       idleDebounceTimer = null;
+    }
+
+    if (livePreviewTimer) {
+      clearTimeout(livePreviewTimer);
+      pendingTimers.delete(livePreviewTimer);
+      livePreviewTimer = null;
     }
 
   };
@@ -430,6 +498,7 @@ export async function runPrompt(
         pendingVisibleTextAfterConfirmation = false;
       }
       lastVisibleTextAt = Date.now();
+      scheduleLivePreviewRender();
 
       if (sawBackgroundEvidence && resumedFromConfirmation && !isFinalized) {
         scheduleIdleCheck(FINAL_TEXT_SETTLE_MS);
@@ -695,6 +764,8 @@ export async function runPrompt(
         sessionBusyState = 'busy';
       } else if (parentStatus === 'idle') {
         sessionBusyState = 'idle';
+      } else {
+        sessionBusyState = 'unknown';
       }
 
       for (const childId of childSessionIds) {
@@ -877,10 +948,12 @@ export async function runPrompt(
         await refreshChildSessions();
         await refreshSessionStatuses();
 
-        const busyState =
-          sessionBusyState !== 'unknown'
-            ? sessionBusyState
-            : await sessionManager.getSessionBusyState(port, sessionId);
+        const needsFreshBusyCheck =
+          sessionBusyState === 'unknown' ||
+          (sessionBusyState === 'busy' && (sawCompletionSignal || canFinalizeFromVisibleText()));
+        const busyState = needsFreshBusyCheck
+          ? await sessionManager.getSessionBusyState(port, sessionId)
+          : sessionBusyState;
         if (busyState === 'busy' && !isFinalized) {
           unknownBusyChecks = 0;
           setPhase(getActivePhase());
