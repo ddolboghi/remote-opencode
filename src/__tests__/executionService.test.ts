@@ -130,6 +130,46 @@ const sseHarness = vi.hoisted(() => {
   return { MockSSEClient };
 });
 
+type StreamEditPayload = {
+  content: string;
+  components?: Array<{
+    components?: Array<{
+      data?: {
+        disabled?: boolean;
+      };
+    }>;
+  }>;
+};
+
+function getLastStreamEditPayload(
+  streamEdit: ReturnType<typeof vi.fn<(payload: StreamEditPayload) => Promise<unknown>>>,
+): StreamEditPayload | undefined {
+  const lastCall = streamEdit.mock.calls.at(-1);
+  if (!lastCall) {
+    return undefined;
+  }
+
+  const [payload] = lastCall as [StreamEditPayload];
+  return payload;
+}
+
+function findStreamEditPayload(
+  streamEdit: ReturnType<typeof vi.fn<(payload: StreamEditPayload) => Promise<unknown>>>,
+  predicate: (payload: StreamEditPayload) => boolean,
+): StreamEditPayload | undefined {
+  const match = streamEdit.mock.calls.find((call) => {
+    const [payload] = call as [StreamEditPayload];
+    return predicate(payload);
+  });
+
+  if (!match) {
+    return undefined;
+  }
+
+  const [payload] = match as [StreamEditPayload];
+  return payload;
+}
+
 const dataStoreMock = vi.hoisted(() => ({
   getChannelProjectPath: vi.fn(),
   getWorktreeMapping: vi.fn(),
@@ -188,9 +228,10 @@ describe('executionService messaging and completion handling', () => {
   const sessionId = 'session-1';
   const contextHeader = '🌿 `main` · 🤖 `default`';
 
-  let streamEdit: ReturnType<typeof vi.fn>;
+  let streamEdit: ReturnType<typeof vi.fn<(payload: StreamEditPayload) => Promise<unknown>>>;
   let channelSend: ReturnType<typeof vi.fn>;
   let channel: { send: ReturnType<typeof vi.fn> };
+  let streamMessage: { edit: (payload: StreamEditPayload) => Promise<unknown> };
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -227,11 +268,14 @@ describe('executionService messaging and completion handling', () => {
     queueManagerMock.processNextInQueue.mockResolvedValue(undefined);
 
     streamEdit = vi.fn().mockResolvedValue({});
+    streamMessage = {
+      edit: (payload: StreamEditPayload) => streamEdit(payload),
+    };
     let sendCount = 0;
     channelSend = vi.fn().mockImplementation(async (payload: { content?: string }) => {
       sendCount += 1;
       if (sendCount === 1) {
-        return { edit: streamEdit };
+        return streamMessage;
       }
       return payload;
     });
@@ -266,9 +310,11 @@ describe('executionService messaging and completion handling', () => {
 
     await vi.advanceTimersByTimeAsync(1000);
 
-    const runningContent = streamEdit.mock.calls.at(-1)?.[0].content as string;
-    expect(runningContent).toContain('**Running...**');
+    const editContentsAfterStreaming = streamEdit.mock.calls.map(([payload]) => payload.content as string);
+    const runningContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
+    expect(editContentsAfterStreaming.some((content) => content.includes('Running...'))).toBe(true);
     expect(runningContent).not.toContain(prompt);
+    expect(runningContent).not.toContain('A'.repeat(200));
     expect(runningContent.length).toBeLessThanOrEqual(2000);
 
     client.emitSessionIdle(sessionId);
@@ -276,11 +322,41 @@ describe('executionService messaging and completion handling', () => {
     client.emitCompletion(sessionId);
     await vi.advanceTimersByTimeAsync(0);
 
-    const finalContent = streamEdit.mock.calls.at(-1)?.[0].content as string;
+    const finalContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
     expect(finalContent.startsWith(`${contextHeader}\n\n`)).toBe(true);
-    expect(finalContent).not.toContain('**Running...**');
+    expect(finalContent).not.toContain('Running...');
     expect(finalContent).not.toContain(prompt);
     expect(finalContent.length).toBeLessThanOrEqual(2000);
+  });
+
+  it('keeps the active representative message status-oriented instead of repainting streamed transcript text', async () => {
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    const editCountBeforeStreaming = streamEdit.mock.calls.length;
+    const streamedText = 'Live transcript body '.repeat(160);
+
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-live-status-only',
+      text: streamedText,
+    });
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const editContents = streamEdit.mock.calls.map(([payload]) => payload.content as string);
+    expect(streamEdit.mock.calls.length).toBe(editCountBeforeStreaming);
+    expect(editContents.some((content) => content.includes('Running...'))).toBe(true);
+    expect(editContents.some((content) => content.includes('Live transcript body'))).toBe(false);
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+    client.emitCompletion(sessionId);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const finalContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
+    expect(finalContent).toContain('Live transcript body');
+    expect(finalContent).not.toContain('Running...');
   });
 
   it('finalizes when the parent status turns idle without a session.idle event', async () => {
@@ -305,7 +381,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents).toContain('✅ Done');
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer from a parent idle status event');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
     expect(sessionManagerMock.clearSseClient).toHaveBeenCalledWith(threadId);
@@ -332,7 +408,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents).toContain('✅ Done');
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer from a completion signal');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
@@ -363,7 +439,7 @@ describe('executionService messaging and completion handling', () => {
     await runPromise;
     await vi.advanceTimersByTimeAsync(0);
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Quota exhausted');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
     expect(sessionManagerMock.clearSseClient).toHaveBeenCalledWith(threadId);
@@ -375,24 +451,24 @@ describe('executionService messaging and completion handling', () => {
     expect(sentContents).toContain('❌ Execution failed. Queue cleared. Use `/queue settings` to change this behavior.');
   });
 
-  it('falls back to sending all final chunks when the final edit fails', async () => {
-    streamEdit.mockImplementation(async (payload: { content: string }) => {
-      const { content } = payload;
-      const isFinalContent =
-        content.startsWith(`${contextHeader}\n\n`) &&
-        !content.includes('**Running...**') &&
-        !content.includes('Starting OpenCode server') &&
-        !content.includes('Waiting for OpenCode server') &&
-        !content.includes('Sending prompt') &&
-        !content.includes('No output received') &&
-        !content.includes('Connection error') &&
-        !content.includes('OpenCode execution failed') &&
-        !content.includes('**Error**');
+  it('falls back to sending all final chunks when only the status-only cleanup succeeds', async () => {
+    let lastSuccessfulStreamEditPayload: StreamEditPayload | undefined;
 
-      if (isFinalContent) {
-        throw new Error('Invalid Form Body');
+    streamEdit.mockImplementation(async (payload: StreamEditPayload) => {
+      const { content } = payload;
+      const isFinalSettlement = content.startsWith(`${contextHeader}\n\n✅ Done\n\n`);
+      const isStatusOnlySettlement = content === `${contextHeader}\n\n✅ Done — output continued below.`;
+
+      if (isFinalSettlement || isStatusOnlySettlement) {
+        if (isFinalSettlement) {
+          throw new Error('Invalid Form Body');
+        }
+
+        lastSuccessfulStreamEditPayload = payload;
+        return {};
       }
 
+      lastSuccessfulStreamEditPayload = payload;
       return {};
     });
 
@@ -422,10 +498,80 @@ describe('executionService messaging and completion handling', () => {
     expect(fallbackChunks.every(content => !content.includes(prompt))).toBe(true);
     expect(sentContents).toContain('✅ Done');
 
-    const cleanupEdit = streamEdit.mock.calls.find(([payload]) =>
-      typeof payload.content === 'string' && payload.content.includes('Output continued below.'),
-    )?.[0];
+    const cleanupEdit = findStreamEditPayload(
+      streamEdit,
+      (payload) => payload?.components?.[0]?.components?.[0]?.data?.disabled === true,
+    );
     expect(cleanupEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+    expect(lastSuccessfulStreamEditPayload?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+  });
+
+  it('sends a warning instead of chunks when both terminal settlement edits fail', async () => {
+    let lastSuccessfulStreamEditPayload: StreamEditPayload | undefined;
+
+    streamEdit.mockImplementation(async (payload: StreamEditPayload) => {
+      const { content } = payload;
+      const isFinalSettlement = content.startsWith(`${contextHeader}\n\n✅ Done\n\n`);
+      const isStatusOnlySettlement = content === `${contextHeader}\n\n✅ Done — output continued below.`;
+
+      if (isFinalSettlement || isStatusOnlySettlement) {
+        throw new Error('Invalid Form Body');
+      }
+
+      lastSuccessfulStreamEditPayload = payload;
+      return {};
+    });
+
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-1',
+      text: 'Long final answer paragraph. '.repeat(220),
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+    client.emitCompletion(sessionId);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sentContents.some((content) => content.includes('Long final answer paragraph. '))).toBe(false);
+    expect(sentContents).toContain('⚠️ Final response could not be posted safely because terminal cleanup failed.');
+    expect(lastSuccessfulStreamEditPayload?.components?.[0]?.components?.[0]?.data?.disabled).not.toBe(true);
+  });
+
+  it('marks the original stream message done and clears busy state before sending overflow chunks', async () => {
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-long-final',
+      text: 'Long final answer paragraph. '.repeat(220),
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+    client.emitCompletion(sessionId);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const finalEdit = getLastStreamEditPayload(streamEdit);
+    expect(finalEdit?.content).toContain('✅ Done');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+
+    const clearCallOrder = sessionManagerMock.clearSseClient.mock.invocationCallOrder[0];
+    const trailingSendCallOrders = channelSend.mock.invocationCallOrder.slice(1);
+    expect(clearCallOrder).toBeLessThan(Math.max(...trailingSendCallOrders));
   });
 
   it('shows finalizing response while confirming completion if no background evidence has been observed', async () => {
@@ -443,7 +589,7 @@ describe('executionService messaging and completion handling', () => {
     client.emitSessionIdle(sessionId);
     await vi.advanceTimersByTimeAsync(1000);
 
-    const latestContent = streamEdit.mock.calls.at(-1)?.[0].content as string;
+    const latestContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
     expect(latestContent).toContain('Finalizing response...');
     expect(latestContent).not.toContain('Waiting for background agents...');
 
@@ -469,7 +615,7 @@ describe('executionService messaging and completion handling', () => {
     await vi.advanceTimersByTimeAsync(3000);
     await vi.advanceTimersByTimeAsync(1000);
 
-    const latestContent = streamEdit.mock.calls.at(-1)?.[0].content as string;
+    const latestContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
     expect(latestContent).toContain('Waiting for background agents...');
 
     const sentContents = channelSend.mock.calls
@@ -501,7 +647,7 @@ describe('executionService messaging and completion handling', () => {
     await vi.advanceTimersByTimeAsync(3000);
     await vi.advanceTimersByTimeAsync(1000);
 
-    const latestContent = streamEdit.mock.calls.at(-1)?.[0].content as string;
+    const latestContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
     expect(latestContent).toContain('Generating final response...');
 
     const sentContents = channelSend.mock.calls
@@ -553,7 +699,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents.some((content) => content.includes('Done'))).toBe(true);
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer from the parent session');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
@@ -605,7 +751,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents.some((content) => content.includes('Done'))).toBe(true);
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer from the same parent message');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
@@ -644,7 +790,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents.some((content) => content.includes('Done'))).toBe(false);
 
-    const midEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const midEdit = getLastStreamEditPayload(streamEdit);
     expect(midEdit?.components?.[0]?.components?.[0]?.data?.disabled).not.toBe(true);
 
     await vi.advanceTimersByTimeAsync(5000);
@@ -656,7 +802,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents.some((content) => content.includes('Done'))).toBe(true);
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer streamed from the parent session');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
@@ -719,7 +865,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents.some((content) => content.includes('Done'))).toBe(true);
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer after background work');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
@@ -782,7 +928,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents.some((content) => content.includes('Done'))).toBe(true);
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer after child completion');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
@@ -806,7 +952,7 @@ describe('executionService messaging and completion handling', () => {
     client.emitSessionIdle(sessionId);
     await vi.advanceTimersByTimeAsync(1000);
 
-    const latestContent = streamEdit.mock.calls.at(-1)?.[0].content as string;
+    const latestContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
     expect(latestContent).toContain('Waiting for background agents...');
 
     const sentContents = channelSend.mock.calls
@@ -837,7 +983,7 @@ describe('executionService messaging and completion handling', () => {
     client.emitBackgroundTaskCompleted(sessionId);
     await vi.advanceTimersByTimeAsync(1000);
 
-    const latestContent = streamEdit.mock.calls.at(-1)?.[0].content as string;
+    const latestContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
     expect(latestContent).toContain('Generating final response...');
 
     const sentContents = channelSend.mock.calls
@@ -845,6 +991,94 @@ describe('executionService messaging and completion handling', () => {
       .map(([payload]) => payload.content as string);
 
     expect(sentContents).not.toContain('??Done');
+  });
+
+  it('keeps Discord send/edit flow alive across repeated background-task phases in one run', async () => {
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    const editContents = (): string[] =>
+      streamEdit.mock.calls.map(([payload]) => payload.content as string);
+
+    client.emitMessagePart({
+      type: 'subtask',
+      sessionID: sessionId,
+      id: 'part-1',
+      messageID: 'msg-1',
+      prompt: 'Investigate API behavior',
+      description: 'Background worker 1',
+      agent: 'general',
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(getLastStreamEditPayload(streamEdit)?.content).toContain('Waiting for background agents...');
+
+    client.emitBackgroundTaskCompleted(sessionId);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(getLastStreamEditPayload(streamEdit)?.content).toContain('Generating final response...');
+
+    const firstGeneratingIndex = editContents().findIndex((content) =>
+      content.includes('Generating final response...'),
+    );
+    expect(firstGeneratingIndex).toBeGreaterThanOrEqual(0);
+
+    client.emitMessagePart({
+      type: 'subtask',
+      sessionID: sessionId,
+      id: 'part-2',
+      messageID: 'msg-1',
+      prompt: 'Investigate follow-up behavior',
+      description: 'Background worker 2',
+      agent: 'general',
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const secondWaitingIndex = editContents().findIndex(
+      (content, index) =>
+        index > firstGeneratingIndex && content.includes('Waiting for background agents...'),
+    );
+    expect(secondWaitingIndex).toBeGreaterThan(firstGeneratingIndex);
+
+    client.emitBackgroundTaskCompleted(sessionId);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const secondGeneratingIndex = editContents().findIndex(
+      (content, index) =>
+        index > secondWaitingIndex && content.includes('Generating final response...'),
+    );
+    expect(secondGeneratingIndex).toBeGreaterThan(secondWaitingIndex);
+
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-1',
+      text: 'Final answer after multiple background phases',
+    });
+
+    await vi.advanceTimersByTimeAsync(1600);
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).toContain('✅ Done');
+    expect(sentContents.indexOf('✅ Done')).toBe(sentContents.length - 1);
+
+    const finalEdit = getLastStreamEditPayload(streamEdit);
+    expect(finalEdit?.content).toContain('Final answer after multiple background phases');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
 
   it('finalizes when final visible text arrives after waiting with background evidence even without a step_finish event', async () => {
@@ -884,7 +1118,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents).toContain('✅ Done');
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer from the main agent');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
@@ -989,7 +1223,7 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents).toContain('✅ Done');
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer after child failure');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
@@ -1016,8 +1250,38 @@ describe('executionService messaging and completion handling', () => {
     expect(client.disconnect).toHaveBeenCalledTimes(1);
     expect(sessionManagerMock.clearSseClient).toHaveBeenCalledWith(threadId);
 
-    const finalEdit = streamEdit.mock.calls.at(-1)?.[0];
+    const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('⏹️ Interrupted.');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+  });
+
+  it('does not let a queued stream tick overwrite the interrupted terminal state', async () => {
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-queued-tick',
+      text: 'Still running before queued tick cleanup',
+    });
+
+    const interrupted = await interruptActiveRun(threadId);
+    expect(interrupted).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const editCountAfterInterrupt = streamEdit.mock.calls.length;
+    client.emitSessionStatus(sessionId, { type: 'busy' });
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-queued-tick',
+      text: 'Late activity after interrupt should not revive active UI',
+    });
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const finalEdit = getLastStreamEditPayload(streamEdit);
+    expect(finalEdit?.content).toContain('⏹️ Interrupted.');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+    expect(streamEdit).toHaveBeenCalledTimes(editCountAfterInterrupt);
   });
 });

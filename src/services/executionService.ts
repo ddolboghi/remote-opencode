@@ -11,7 +11,7 @@ import * as sessionManager from './sessionManager.js';
 import * as serveManager from './serveManager.js';
 import * as worktreeManager from './worktreeManager.js';
 import { SSEClient } from './sseClient.js';
-import { formatOutput, formatOutputForMobile, buildContextHeader } from '../utils/messageFormatter.js';
+import { formatOutputForMobile, buildContextHeader } from '../utils/messageFormatter.js';
 import { processNextInQueue } from './queueManager.js';
 import type { SSEEvent, SessionErrorInfo } from '../types/index.js';
 
@@ -35,6 +35,14 @@ type CompletionPhase =
 
 function buildStatusContent(contextHeader: string, statusLine: string): string {
   return `${contextHeader}\n\n${statusLine}`;
+}
+
+function buildTerminalContent(contextHeader: string, statusLine: string, body?: string): string {
+  if (!body?.trim()) {
+    return buildStatusContent(contextHeader, statusLine);
+  }
+
+  return `${contextHeader}\n\n${statusLine}\n\n${body}`;
 }
 
 function getContentBudget(prefix: string): number {
@@ -152,10 +160,8 @@ export async function runPrompt(
   
   let port: number;
   let sessionId: string;
-  let updateInterval: NodeJS.Timeout | null = null;
   let accumulatedText = '';
   let lastContent = '';
-  let tick = 0;
   let promptSent = false;
   let isSendingPrompt = false;
   let hasSessionError = false;
@@ -194,7 +200,6 @@ export async function runPrompt(
     sawCompletion: false,
     error: null,
   };
-  const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   
   const syncAccumulatedFromLocalRoles = () => {
     const filteredTexts = Array.from(messageTexts.entries())
@@ -262,6 +267,53 @@ export async function runPrompt(
     return true;
   };
 
+  const getActiveStatusLine = (): string => {
+    if (phase === 'waiting_children') {
+      return 'Waiting for background agents...';
+    }
+
+    if (phase === 'awaiting_parent_final') {
+      return 'Generating final response...';
+    }
+
+    if (phase === 'awaiting_confirmation' || phase === 'finalizing') {
+      return 'Finalizing response...';
+    }
+
+    return 'Running...';
+  };
+
+  const renderRepresentativeStatus = async (statusLine: string): Promise<void> => {
+    if (isFinalized) {
+      return;
+    }
+
+    const content = buildStatusContent(contextHeader, statusLine);
+    if (content === lastContent) {
+      return;
+    }
+
+    const edited = await updateStreamMessage(content, [buttons]);
+    if (edited) {
+      lastContent = content;
+    }
+  };
+
+  const renderActiveRepresentative = async (): Promise<void> => {
+    await renderRepresentativeStatus(getActiveStatusLine());
+  };
+
+  const setPhase = (nextPhase: CompletionPhase): void => {
+    if (phase === nextPhase) {
+      return;
+    }
+
+    phase = nextPhase;
+    if (!isFinalized) {
+      void renderActiveRepresentative();
+    }
+  };
+
   const clearRuntimeArtifacts = (): void => {
     activeRunInterruptHandlers.delete(threadId);
 
@@ -271,10 +323,6 @@ export async function runPrompt(
       idleDebounceTimer = null;
     }
 
-    if (updateInterval) {
-      clearInterval(updateInterval);
-      updateInterval = null;
-    }
   };
 
   const disconnectActiveSseClient = (): void => {
@@ -283,11 +331,19 @@ export async function runPrompt(
     sessionManager.clearSseClient(threadId);
   };
 
-  const settleTerminalStreamMessage = async (content: string, fallbackStatusLine: string): Promise<boolean> => {
+  type TerminalStreamSettlementResult =
+    | { kind: 'full' }
+    | { kind: 'status_only' }
+    | { kind: 'failed' };
+
+  const settleTerminalStreamMessage = async (
+    content: string,
+    fallbackStatusLine: string,
+  ): Promise<TerminalStreamSettlementResult> => {
     const disabledButtons = [buildInterruptRow(threadId, true)];
     const edited = await updateStreamMessage(content, disabledButtons);
     if (edited) {
-      return true;
+      return { kind: 'full' };
     }
 
     try {
@@ -295,6 +351,7 @@ export async function runPrompt(
         content: buildStatusContent(contextHeader, fallbackStatusLine),
         components: disabledButtons,
       });
+      return { kind: 'status_only' };
     } catch (error) {
       console.error(
         'Failed to settle stream message after terminal edit failure:',
@@ -302,7 +359,7 @@ export async function runPrompt(
       );
     }
 
-    return false;
+    return { kind: 'failed' };
   };
 
   const finalizeInterruptedRun = async (): Promise<boolean> => {
@@ -311,14 +368,14 @@ export async function runPrompt(
     }
 
     isFinalized = true;
-    phase = 'done';
+    setPhase('done');
     clearRuntimeArtifacts();
 
     const settledOriginalMessage = await settleTerminalStreamMessage(
       buildStatusContent(contextHeader, '⏹️ Interrupted.'),
       '⏹️ Interrupted.',
     );
-    if (!settledOriginalMessage) {
+    if (settledOriginalMessage.kind === 'failed') {
       await safeSend('⏹️ Interrupted.');
     }
 
@@ -386,7 +443,7 @@ export async function runPrompt(
         sawBackgroundEvidence = true;
         void refreshChildSessions();
         if (phase === 'awaiting_confirmation') {
-          phase = 'waiting_children';
+          setPhase('waiting_children');
         }
       }
     });
@@ -396,7 +453,7 @@ export async function runPrompt(
       sawBackgroundEvidence = true;
       void refreshChildSessions();
       if (phase === 'waiting_children' && !sawCompletionSignal) {
-        phase = 'awaiting_parent_final';
+        setPhase('awaiting_parent_final');
       }
     });
 
@@ -418,7 +475,7 @@ export async function runPrompt(
     const finalize = async () => {
       if (isFinalized) return;
       isFinalized = true;
-      phase = 'done';
+      setPhase('done');
       clearRuntimeArtifacts();
 
       try {
@@ -430,39 +487,60 @@ export async function runPrompt(
         await refreshAccumulatedText();
 
         if (!accumulatedText.trim()) {
-          const edited = await settleTerminalStreamMessage(
+          const settlement = await settleTerminalStreamMessage(
             buildStatusContent(contextHeader, '⚠️ No output received — the model may have encountered an issue.'),
             '⚠️ No output received — see follow-up message.'
           );
-          if (!edited) {
+          disconnectActiveSseClient();
+          if (settlement.kind === 'failed') {
             await safeSend('⚠️ No output received — the model may have encountered an issue.');
           }
           await safeSend('⚠️ Done (no output received)');
         } else {
-          const prefix = `${contextHeader}\n\n`;
+          const terminalStatusLine = '✅ Done';
+          const prefix = `${contextHeader}\n\n${terminalStatusLine}\n\n`;
           const firstChunkBudget = getContentBudget(prefix);
           const result = formatOutputForMobile(accumulatedText, firstChunkBudget);
 
-          const editSuccess = await settleTerminalStreamMessage(
-            prefix + result.chunks[0],
-            result.chunks.length > 1 ? '✅ Output continued below.' : '✅ Done'
+          const settlement = await settleTerminalStreamMessage(
+            buildTerminalContent(contextHeader, terminalStatusLine, result.chunks[0]),
+            result.chunks.length > 1 ? '✅ Done — output continued below.' : terminalStatusLine
           );
 
-          // If edit failed (e.g., content exceeds Discord's 2000-char limit), send all chunks as new messages
-          const startIndex = editSuccess ? 1 : 0;
-          for (let i = startIndex; i < result.chunks.length; i++) {
-            await safeSend(result.chunks[i]);
+          disconnectActiveSseClient();
+
+          if (settlement.kind === 'failed') {
+            await safeSend('⚠️ Final response could not be posted safely because terminal cleanup failed.');
+          } else {
+            const startIndex = settlement.kind === 'full' ? 1 : 0;
+            for (let i = startIndex; i < result.chunks.length; i++) {
+              await safeSend(result.chunks[i]);
+            }
+
+            await safeSend('✅ Done');
           }
-
-          await safeSend('✅ Done');
         }
-
-        disconnectActiveSseClient();
 
         await processNextInQueue(channel, threadId, parentChannelId);
       } catch (error) {
         console.error('Error in finalize:', error);
-        await safeSend('❌ An unexpected error occurred while processing the response.');
+
+        const settlement = await settleTerminalStreamMessage(
+          buildStatusContent(contextHeader, '❌ An unexpected error occurred while finalizing the response.'),
+          '❌ Finalization failed — see follow-up message.',
+        );
+        disconnectActiveSseClient();
+        if (settlement.kind === 'failed') {
+          await safeSend('❌ An unexpected error occurred while finalizing the response.');
+        }
+
+        const settings = dataStore.getQueueSettings(threadId);
+        if (settings.continueOnFailure) {
+          await processNextInQueue(channel, threadId, parentChannelId);
+        } else {
+          dataStore.clearQueue(threadId);
+          await safeSend('❌ Execution failed. Queue cleared. Use `/queue settings` to change this behavior.');
+        }
       }
     };
 
@@ -764,19 +842,20 @@ export async function runPrompt(
     const resetIdleTracking = () => {
       clearIdleTimer();
       idleStartTime = null;
-      phase = getActivePhase();
+      setPhase(getActivePhase());
       unknownBusyChecks = 0;
     };
 
     const scheduleIdleCheck = (delay: number) => {
       if (isFinalized) return;
       clearIdleTimer();
-      phase =
+      setPhase(
         childSessionIds.size > 0 && !anyChildBusy() && !anyChildUnknown()
           ? 'awaiting_parent_final'
           : sawBackgroundEvidence
             ? 'waiting_children'
-            : 'awaiting_confirmation';
+            : 'awaiting_confirmation'
+      );
 
       if (idleStartTime === null) {
         idleStartTime = Date.now();
@@ -804,6 +883,7 @@ export async function runPrompt(
             : await sessionManager.getSessionBusyState(port, sessionId);
         if (busyState === 'busy' && !isFinalized) {
           unknownBusyChecks = 0;
+          setPhase(getActivePhase());
           scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
           return;
         }
@@ -815,7 +895,7 @@ export async function runPrompt(
             if (!sawCompletionSignal) {
               logFallbackFinalize('stable_visible_text_after_unknown_busy_checks');
             }
-            phase = 'finalizing';
+            setPhase('finalizing');
             await finalize();
             return;
           }
@@ -828,7 +908,7 @@ export async function runPrompt(
 
         if (childSessionIds.size > 0) {
           if (anyChildBusy()) {
-            phase = 'waiting_children';
+            setPhase('waiting_children');
             scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
             return;
           }
@@ -836,7 +916,7 @@ export async function runPrompt(
           if (anyChildUnknown()) {
             const hasConfirmedParentFinalMessage = await confirmLatestParentAssistantMessage();
             if (!hasConfirmedParentFinalMessage && !isFinalized) {
-              phase = 'waiting_children';
+              setPhase('waiting_children');
               scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
               return;
             }
@@ -847,14 +927,14 @@ export async function runPrompt(
             markUnknownChildrenIdle();
           }
 
-          phase = 'awaiting_parent_final';
+          setPhase('awaiting_parent_final');
           const hasConfirmedParentFinalMessage = await confirmLatestParentAssistantMessage();
           if (!hasConfirmedParentFinalMessage && !isFinalized) {
             scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
             return;
           }
 
-          phase = 'finalizing';
+          setPhase('finalizing');
           await finalize();
           return;
         }
@@ -868,7 +948,7 @@ export async function runPrompt(
           logFallbackFinalize('stable_visible_text_with_idle_session');
         }
 
-        phase = 'finalizing';
+        setPhase('finalizing');
         await finalize();
       }, delay);
       pendingTimers.add(idleDebounceTimer);
@@ -881,16 +961,16 @@ export async function runPrompt(
 
       hasSessionError = true;
       isFinalized = true;
-      phase = 'done';
+      setPhase('done');
       clearRuntimeArtifacts();
 
       try {
         const errorMsg = errorInfo.data?.message || errorInfo.name || 'Unknown error';
-        const edited = await settleTerminalStreamMessage(
+        const settlement = await settleTerminalStreamMessage(
           buildStatusContent(contextHeader, `❌ **Error**: ${errorMsg}`),
           '❌ Error — see follow-up message.',
         );
-        if (!edited) {
+        if (settlement.kind === 'failed') {
           await safeSend(`❌ **Error**: ${errorMsg}`);
         }
 
@@ -1035,16 +1115,16 @@ export async function runPrompt(
       }
 
       isFinalized = true;
-      phase = 'done';
+      setPhase('done');
       clearRuntimeArtifacts();
       
       (async () => {
         try {
-          const edited = await settleTerminalStreamMessage(
+          const settlement = await settleTerminalStreamMessage(
             buildStatusContent(contextHeader, `❌ Connection error: ${error.message}`),
             '❌ Connection error — see follow-up message.',
           );
-          if (!edited) {
+          if (settlement.kind === 'failed') {
             await safeSend(`❌ Connection error: ${error.message}`);
           }
 
@@ -1064,35 +1144,6 @@ export async function runPrompt(
       })();
     });
     
-    updateInterval = setInterval(async () => {
-      tick++;
-      try {
-        const spinnerChar = spinner[tick % spinner.length];
-        const statusLabel =
-          phase === 'waiting_children'
-            ? 'Waiting for background agents...'
-            : phase === 'awaiting_parent_final'
-              ? 'Generating final response...'
-              : phase === 'awaiting_confirmation' || phase === 'finalizing'
-              ? 'Finalizing response...'
-              : 'Running...';
-        const prefix = `${contextHeader}\n\n${spinnerChar} **${statusLabel}**\n`;
-        const formatted = formatOutput(accumulatedText, getContentBudget(prefix));
-        const newContent = formatted || 'Processing...';
-        const renderedContent = prefix + newContent;
-        
-        if (renderedContent !== lastContent || tick % 2 === 0) {
-          lastContent = renderedContent;
-          await updateStreamMessage(
-            renderedContent,
-            [buttons]
-          );
-        }
-      } catch (error) {
-        console.error('Error in stream update interval:', error instanceof Error ? error.message : error);
-      }
-    }, 1000);
-    
     await updateStreamMessage(buildStatusContent(contextHeader, '📝 Sending prompt...'), [buttons]);
     isSendingPrompt = true;
     clearBufferedParentSignals();
@@ -1100,6 +1151,7 @@ export async function runPrompt(
     isSendingPrompt = false;
     if (isFinalized) return;
     promptSent = true;
+    await renderActiveRepresentative();
     await replayBufferedParentSignals();
     
   } catch (error) {
@@ -1112,13 +1164,13 @@ export async function runPrompt(
     clearRuntimeArtifacts();
     
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    const edited = await settleTerminalStreamMessage(
-      buildStatusContent(contextHeader, `❌ OpenCode execution failed: ${errorMessage}`),
-      '❌ OpenCode execution failed — see follow-up message.',
-    );
-    if (!edited) {
-      await safeSend(`❌ OpenCode execution failed: ${errorMessage}`);
-    }
+      const settlement = await settleTerminalStreamMessage(
+        buildStatusContent(contextHeader, `❌ OpenCode execution failed: ${errorMessage}`),
+        '❌ OpenCode execution failed — see follow-up message.',
+      );
+      if (settlement.kind === 'failed') {
+        await safeSend(`❌ OpenCode execution failed: ${errorMessage}`);
+      }
 
     disconnectActiveSseClient();
     
