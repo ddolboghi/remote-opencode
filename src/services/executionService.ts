@@ -23,6 +23,7 @@ const MAX_UNKNOWN_BUSY_CHECKS = 3;
 const LIVE_PREVIEW_DEBOUNCE_MS = 400;
 const DISCORD_MESSAGE_LIMIT = 2000;
 const MIN_CONTENT_BUDGET = 200;
+const BACKGROUND_DISPATCH_VISIBLE_TEXT_REGEX = /\bbackground\s+task\s+(?:dispatched|dispatching|spawned|spawning|launched|launching|started|starting)\b/i;
 const pendingTimers = new Set<NodeJS.Timeout>();
 const activeRunInterruptHandlers = new Map<string, () => Promise<boolean>>();
 
@@ -48,6 +49,10 @@ function buildTerminalContent(contextHeader: string, statusLine: string, body?: 
 
 function getContentBudget(prefix: string): number {
   return Math.max(DISCORD_MESSAGE_LIMIT - prefix.length, MIN_CONTENT_BUDGET);
+}
+
+function indicatesBackgroundDispatchVisibleText(text: string): boolean {
+  return BACKGROUND_DISPATCH_VISIBLE_TEXT_REGEX.test(text);
 }
 
 function buildInterruptRow(threadId: string, disabled: boolean): ActionRowBuilder<ButtonBuilder> {
@@ -271,18 +276,18 @@ export async function runPrompt(
 
   const getActiveStatusLine = (): string => {
     if (phase === 'waiting_children') {
-      return 'Waiting for background agents...';
+      return '⏳ Waiting for background agents...';
     }
 
     if (phase === 'awaiting_parent_final') {
-      return 'Generating final response...';
+      return '📝 Generating final response...';
     }
 
     if (phase === 'awaiting_confirmation' || phase === 'finalizing') {
-      return 'Finalizing response...';
+      return '📦 Finalizing response...';
     }
 
-    return 'Running...';
+    return '🤖 Running...';
   };
 
   const renderRepresentativeStatus = async (statusLine: string): Promise<void> => {
@@ -487,6 +492,7 @@ export async function runPrompt(
     sseClient.onPartUpdated((part) => {
       if (part.sessionID !== sessionId) return;
       const resumedFromConfirmation = pendingVisibleTextAfterConfirmation;
+      const hasBackgroundDispatchSignal = indicatesBackgroundDispatchVisibleText(part.text);
       if (!messageRoles.has(part.messageID)) {
         messageRoles.set(part.messageID, 'assistant');
       }
@@ -499,6 +505,14 @@ export async function runPrompt(
       }
       lastVisibleTextAt = Date.now();
       scheduleLivePreviewRender();
+
+      if (hasBackgroundDispatchSignal) {
+        sawBackgroundEvidence = true;
+        void refreshChildSessions();
+        if (phase === 'awaiting_confirmation') {
+          setPhase('waiting_children');
+        }
+      }
 
       if (sawBackgroundEvidence && resumedFromConfirmation && !isFinalized) {
         scheduleIdleCheck(FINAL_TEXT_SETTLE_MS);
@@ -1013,6 +1027,12 @@ export async function runPrompt(
         }
 
         if (!sawCompletionSignal && !canFinalizeFromVisibleText() && !isFinalized) {
+          scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
+          return;
+        }
+
+        if (sawBackgroundEvidence && !canFinalizeFromVisibleText() && !isFinalized) {
+          setPhase('awaiting_parent_final');
           scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
           return;
         }
