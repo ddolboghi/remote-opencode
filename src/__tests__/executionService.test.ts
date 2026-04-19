@@ -578,7 +578,7 @@ describe('executionService messaging and completion handling', () => {
     expect(clearCallOrder).toBeLessThan(Math.max(...trailingSendCallOrders));
   });
 
-  it('shows finalizing response while confirming completion if no background evidence has been observed', async () => {
+  it('treats parent background-dispatch visible text as background evidence', async () => {
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
     const client = sseHarness.MockSSEClient.instances[0];
@@ -594,8 +594,8 @@ describe('executionService messaging and completion handling', () => {
     await vi.advanceTimersByTimeAsync(1000);
 
     const latestContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
-    expect(latestContent).toContain('Finalizing response...');
-    expect(latestContent).not.toContain('Waiting for background agents...');
+    expect(latestContent).toContain('Waiting for background agents...');
+    expect(latestContent).not.toContain('Finalizing response...');
 
     const sentContents = channelSend.mock.calls
       .slice(1)
@@ -603,6 +603,32 @@ describe('executionService messaging and completion handling', () => {
 
     expect(sentContents).not.toContain('✅ Done');
   });
+
+  it('does not finalize or disconnect SSE when the parent only reports background dispatch in visible text', async () => {
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-parent-dispatch-only',
+      text: 'background task dispatched',
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+    client.emitCompletion(sessionId);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
+  });
+
   it('does not finalize while a child session is still busy', async () => {
     sessionManagerMock.getSessionChildren.mockResolvedValue([
       { id: 'child-1', title: 'Background child' },
