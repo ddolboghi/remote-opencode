@@ -35,6 +35,16 @@ type CompletionPhase =
   | 'finalizing'
   | 'done';
 
+type ChildCompletionState =
+  | 'busy'
+  | 'retry'
+  | 'awaiting_assistant_message'
+  | 'message_incomplete'
+  | 'tool_running'
+  | 'unknown'
+  | 'terminal_success'
+  | 'terminal_error';
+
 function buildStatusContent(contextHeader: string, statusLine: string): string {
   return `${contextHeader}\n\n${statusLine}`;
 }
@@ -181,6 +191,7 @@ export async function runPrompt(
   let triggerStructuredBackgroundReconciliation: (() => void) | null = null;
   let sawBackgroundEvidence = false;
   let sawStructuredBackgroundEvidence = false;
+  let sawTrackedChildSessions = false;
   let sawCompletionSignal = false;
   let backgroundBaselineMessageSignature: string | null = null;
   let backgroundBaselineVisibleText: string | null = null;
@@ -188,12 +199,11 @@ export async function runPrompt(
   let parentFinalFallbackConfirmations = 0;
   let lastVisibleTextAt: number | null = null;
   let pendingVisibleTextAfterConfirmation = false;
-  let resumedVisibleTextUpdateCount = 0;
   let unknownBusyChecks = 0;
   let sessionBusyState: sessionManager.SessionBusyState = 'unknown';
   const childSessionIds = new Set<string>();
-  const childTerminalSessionIds = new Set<string>();
-  const childSessionStates = new Map<string, sessionManager.SessionBusyState>();
+  const childSessionStates = new Map<string, ChildCompletionState>();
+  const childSessionErrorHints = new Set<string>();
   let childSessionRefreshInFlight: Promise<void> | null = null;
   let childSessionRefreshQueued = false;
   const messageTexts = new Map<string, string>();
@@ -545,7 +555,6 @@ export async function runPrompt(
       messageTexts.set(part.messageID, part.text);
       syncAccumulatedFromLocalRoles();
       if (resumedFromConfirmation) {
-        resumedVisibleTextUpdateCount += 1;
         pendingVisibleTextAfterConfirmation = false;
       }
       lastVisibleTextAt = Date.now();
@@ -553,7 +562,6 @@ export async function runPrompt(
 
       if (hasBackgroundDispatchSignal) {
         sawBackgroundEvidence = true;
-        resumedVisibleTextUpdateCount = 0;
         backgroundBaselineMessageSignature = JSON.stringify({
           messageId: part.messageID,
           visibleText: accumulatedText.trim(),
@@ -568,11 +576,7 @@ export async function runPrompt(
       }
 
       if (sawBackgroundEvidence && resumedFromConfirmation && !isFinalized) {
-        scheduleIdleCheck(
-          childSessionIds.size > 0 || sawStructuredBackgroundEvidence
-            ? FINAL_TEXT_SETTLE_MS
-            : IDLE_POLL_INTERVAL_MS,
-        );
+        scheduleIdleCheck(FINAL_TEXT_SETTLE_MS);
       }
     });
 
@@ -582,9 +586,6 @@ export async function runPrompt(
       if (part.type === 'subtask' || part.type === 'agent') {
         sawBackgroundEvidence = true;
         sawStructuredBackgroundEvidence = true;
-        resumedVisibleTextUpdateCount = 0;
-        parentFinalFallbackSignature = null;
-        parentFinalFallbackConfirmations = 0;
         syncStructuredBackgroundReconciliationIfWaitingChildren();
         void refreshChildSessions();
         if (phase === 'awaiting_confirmation') {
@@ -595,10 +596,10 @@ export async function runPrompt(
 
     sseClient.onBackgroundSignal((signal) => {
       if (signal.sessionID !== sessionId) return;
-      sawBackgroundEvidence = true;
       void refreshChildSessions();
-      if (phase === 'waiting_children' && !sawCompletionSignal) {
-        setPhase('awaiting_parent_final');
+
+      if (signal.source !== 'system_reminder_background_completed') {
+        sawBackgroundEvidence = true;
       }
     });
 
@@ -750,14 +751,94 @@ export async function runPrompt(
       return Array.isArray(parts) && extractVisibleTextFromParts(parts).length > 0;
     };
 
-    const getLatestParentAssistantMessage = async (): Promise<unknown | null> => {
-      const messages = await sessionManager.getSessionMessages(port, sessionId, 20);
+    const getLatestAssistantMessage = async (targetSessionId: string): Promise<unknown | null> => {
+      const messages = await sessionManager.getSessionMessages(port, targetSessionId, 20);
       for (let i = messages.length - 1; i >= 0; i -= 1) {
         if (isAssistantMessage(messages[i])) {
           return messages[i];
         }
       }
       return null;
+    };
+
+    const getLatestParentAssistantMessage = async (): Promise<unknown | null> =>
+      getLatestAssistantMessage(sessionId);
+
+    const hasUnfinishedToolParts = (parts: unknown[]): boolean =>
+      parts.some((part) => {
+        if (!part || typeof part !== 'object') {
+          return false;
+        }
+
+        const candidate = part as {
+          type?: unknown;
+          state?: { status?: unknown };
+        };
+        if (candidate.type !== 'tool') {
+          return false;
+        }
+
+        return candidate.state?.status === 'pending' || candidate.state?.status === 'running';
+      });
+
+    const evaluateChildSessionState = async (
+      childId: string,
+      statusType: sessionManager.SessionBusyState | 'retry' | undefined,
+    ): Promise<ChildCompletionState> => {
+      const cachedState = childSessionStates.get(childId);
+      const shouldInspectLatestMessage = statusType === 'idle' || childSessionErrorHints.has(childId);
+
+      if (!shouldInspectLatestMessage) {
+        if (statusType === 'busy') {
+          return 'busy';
+        }
+        if (statusType === 'retry') {
+          return 'retry';
+        }
+        if (cachedState === 'terminal_success' || cachedState === 'terminal_error') {
+          return cachedState;
+        }
+        return 'unknown';
+      }
+
+      const latestAssistantMessage = await getLatestAssistantMessage(childId);
+      if (!latestAssistantMessage) {
+        if (statusType === 'busy') {
+          return 'busy';
+        }
+        if (statusType === 'retry') {
+          return 'retry';
+        }
+        return 'awaiting_assistant_message';
+      }
+
+      const info = (latestAssistantMessage as {
+        info?: {
+          time?: { completed?: unknown };
+          error?: unknown;
+        };
+      }).info;
+      const parts = (latestAssistantMessage as { parts?: unknown[] }).parts;
+
+      if (info?.time?.completed == null) {
+        return 'message_incomplete';
+      }
+
+      childSessionErrorHints.delete(childId);
+
+      if (info.error) {
+        return 'terminal_error';
+      }
+
+      if (!Array.isArray(parts) || parts.length === 0) {
+        return 'terminal_error';
+      }
+
+      if (hasUnfinishedToolParts(parts)) {
+        return 'tool_running';
+      }
+
+      return 'terminal_success';
     };
 
     const syncAccumulatedTextFromMessage = (message: unknown): boolean => {
@@ -811,31 +892,34 @@ export async function runPrompt(
           const children = await sessionManager.getSessionChildren(port, sessionId);
           const nextChildIds = new Set(children.map((child) => child.id));
 
-          childSessionIds.clear();
-          for (const childId of nextChildIds) {
-            childSessionIds.add(childId);
+          for (const childId of Array.from(childSessionIds)) {
+            if (nextChildIds.has(childId)) {
+              continue;
+            }
+
+            const previousState = childSessionStates.get(childId);
+            if (previousState === 'terminal_success' || previousState === 'terminal_error') {
+              childSessionIds.delete(childId);
+              childSessionStates.delete(childId);
+              childSessionErrorHints.delete(childId);
+            }
           }
 
-          for (const childId of Array.from(childSessionStates.keys())) {
-            if (!childSessionIds.has(childId)) {
-              childSessionStates.delete(childId);
-              childTerminalSessionIds.delete(childId);
-            }
+          for (const childId of nextChildIds) {
+            childSessionIds.add(childId);
           }
 
           if (childSessionIds.size > 0) {
             const isLateWeakToStructuredPromotion = sawBackgroundEvidence && !sawStructuredBackgroundEvidence;
             sawBackgroundEvidence = true;
+            sawStructuredBackgroundEvidence = true;
+            sawTrackedChildSessions = true;
 
-            if (!sawStructuredBackgroundEvidence) {
-              sawStructuredBackgroundEvidence = true;
-              if (isLateWeakToStructuredPromotion) {
-                resumedVisibleTextUpdateCount = 0;
-                backgroundBaselineMessageSignature = null;
-                backgroundBaselineVisibleText = accumulatedText.trim() || null;
-                parentFinalFallbackSignature = null;
-                parentFinalFallbackConfirmations = 0;
-              }
+            if (isLateWeakToStructuredPromotion) {
+              backgroundBaselineMessageSignature = null;
+              backgroundBaselineVisibleText = accumulatedText.trim() || null;
+              parentFinalFallbackSignature = null;
+              parentFinalFallbackConfirmations = 0;
             }
 
             syncStructuredBackgroundReconciliationIfWaitingChildren();
@@ -878,42 +962,33 @@ export async function runPrompt(
       }
 
       for (const childId of childSessionIds) {
-        if (childTerminalSessionIds.has(childId)) {
-          childSessionStates.set(childId, 'idle');
-          continue;
-        }
-
         const childType = statusMap?.[childId]?.type;
-        if (childType === 'busy' || childType === 'retry') {
-          childSessionStates.set(childId, 'busy');
-        } else if (childType === 'idle') {
-          childSessionStates.set(childId, 'idle');
-        } else {
-          childSessionStates.set(childId, 'unknown');
-        }
+        const nextChildState = await evaluateChildSessionState(childId, childType);
+        childSessionStates.set(childId, nextChildState);
       }
     };
 
     const anyChildBusy = (): boolean =>
-      Array.from(childSessionIds).some((childId) => childSessionStates.get(childId) === 'busy');
+      Array.from(childSessionIds).some((childId) => {
+        const state = childSessionStates.get(childId);
+        return (
+          state === 'busy' ||
+          state === 'retry' ||
+          state === 'awaiting_assistant_message' ||
+          state === 'message_incomplete' ||
+          state === 'tool_running'
+        );
+      });
 
     const anyChildUnknown = (): boolean =>
       Array.from(childSessionIds).some((childId) => childSessionStates.get(childId) === 'unknown');
-
-    const markUnknownChildrenIdle = (): void => {
-      for (const childId of childSessionIds) {
-        if (childSessionStates.get(childId) === 'unknown') {
-          childSessionStates.set(childId, 'idle');
-        }
-      }
-    };
 
     const getActivePhase = (): CompletionPhase => {
       if (!sawBackgroundEvidence) {
         return 'running';
       }
 
-      if (childSessionIds.size > 0 && !anyChildBusy() && !anyChildUnknown()) {
+      if (sawTrackedChildSessions && !anyChildBusy() && !anyChildUnknown()) {
         return 'awaiting_parent_final';
       }
 
@@ -930,10 +1005,6 @@ export async function runPrompt(
       const hasVisibleText = syncAccumulatedTextFromMessage(latestParentMessage);
       if (!hasVisibleText) {
         return false;
-      }
-
-      if (childSessionIds.size === 0) {
-        return true;
       }
 
       if (backgroundBaselineMessageSignature === null) {
@@ -982,68 +1053,11 @@ export async function runPrompt(
       );
 
     const canForceFinalizeAfterUnknownBusy = (): boolean => {
-      if (!hasStableVisibleFinalText()) {
-        return false;
-      }
-
-      if (!sawBackgroundEvidence) {
-        return true;
-      }
-
-      if (childSessionIds.size === 0 && !sawStructuredBackgroundEvidence) {
-        return resumedVisibleTextUpdateCount >= 1;
-      }
-
-      return canFinalizeFromVisibleText();
+      return hasStableVisibleFinalText() && !sawBackgroundEvidence;
     };
 
     const canFinalizeFromVisibleText = (): boolean => {
-      if (!hasStableVisibleFinalText()) {
-        return false;
-      }
-
-      if (!sawBackgroundEvidence) {
-        return true;
-      }
-
-      if (childSessionIds.size === 0) {
-        return sawStructuredBackgroundEvidence
-          ? resumedVisibleTextUpdateCount >= 1
-          : resumedVisibleTextUpdateCount >= 2;
-      }
-
-      return false;
-    };
-
-    const confirmStableWeakBackgroundMessage = async (): Promise<boolean> => {
-      if (childSessionIds.size > 0 || sawStructuredBackgroundEvidence || resumedVisibleTextUpdateCount === 0) {
-        return false;
-      }
-
-      const latestParentMessage = await getLatestParentAssistantMessage();
-      if (!latestParentMessage) {
-        return false;
-      }
-
-      const latestMessageSignature = getMessageSignature(latestParentMessage);
-      const hasVisibleText = syncAccumulatedTextFromMessage(latestParentMessage);
-      if (!hasVisibleText || !hasStableVisibleFinalText()) {
-        return false;
-      }
-
-      const fallbackSignature = latestMessageSignature ?? accumulatedText.trim();
-      if (!fallbackSignature) {
-        return false;
-      }
-
-      if (parentFinalFallbackSignature === fallbackSignature) {
-        parentFinalFallbackConfirmations += 1;
-      } else {
-        parentFinalFallbackSignature = fallbackSignature;
-        parentFinalFallbackConfirmations = 1;
-      }
-
-      return parentFinalFallbackConfirmations >= 2;
+      return hasStableVisibleFinalText() && !sawBackgroundEvidence;
     };
 
     const logFallbackFinalize = (reason: string): void => {
@@ -1074,13 +1088,13 @@ export async function runPrompt(
     };
 
     const shouldEnforceIdleWaitCeiling = (nextPhase: CompletionPhase): boolean =>
-      !(sawStructuredBackgroundEvidence && nextPhase === 'waiting_children');
+      nextPhase !== 'waiting_children';
 
     const scheduleIdleCheck = (delay: number) => {
       if (isFinalized) return;
       clearIdleTimer();
       const nextPhase =
-        childSessionIds.size > 0 && !anyChildBusy() && !anyChildUnknown()
+        sawTrackedChildSessions && !anyChildBusy() && !anyChildUnknown()
           ? 'awaiting_parent_final'
           : sawBackgroundEvidence
             ? 'waiting_children'
@@ -1146,25 +1160,11 @@ export async function runPrompt(
 
         unknownBusyChecks = 0;
 
-        if (childSessionIds.size > 0) {
-          if (anyChildBusy()) {
+        if (sawTrackedChildSessions) {
+          if (anyChildBusy() || anyChildUnknown()) {
             setPhase('waiting_children');
             scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
             return;
-          }
-
-          if (anyChildUnknown()) {
-            const hasConfirmedParentFinalMessage = await confirmLatestParentAssistantMessage();
-            if (!hasConfirmedParentFinalMessage && !isFinalized) {
-              setPhase('waiting_children');
-              scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
-              return;
-            }
-
-            // Some completed child sessions remain in /children but no longer appear
-            // in /session/status. Once the parent final message is confirmed, those
-            // missing children should stop blocking completion.
-            markUnknownChildrenIdle();
           }
 
           setPhase('awaiting_parent_final');
@@ -1179,34 +1179,13 @@ export async function runPrompt(
           return;
         }
 
-        if (
-          sawBackgroundEvidence &&
-          !sawStructuredBackgroundEvidence &&
-          resumedVisibleTextUpdateCount > 0 &&
-          !canFinalizeFromVisibleText() &&
-          !isFinalized
-        ) {
-          const hasConfirmedWeakBackgroundMessage = await confirmStableWeakBackgroundMessage();
-          if (!hasConfirmedWeakBackgroundMessage && !isFinalized) {
-            scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
-            return;
-          }
-
-          if (!isFinalized) {
-            logFallbackFinalize('stable_parent_message_after_weak_background');
-            setPhase('finalizing');
-            await finalize();
-            return;
-          }
-        }
-
         if (!sawCompletionSignal && !canFinalizeFromVisibleText() && !isFinalized) {
           scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
           return;
         }
 
         if (sawBackgroundEvidence && !canFinalizeFromVisibleText() && !isFinalized) {
-          setPhase('awaiting_parent_final');
+          setPhase('waiting_children');
           scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
           return;
         }
@@ -1332,14 +1311,15 @@ export async function runPrompt(
 
       if (childSessionIds.has(statusSessionId)) {
         if (status.type === 'busy' || status.type === 'retry') {
-          childTerminalSessionIds.delete(statusSessionId);
-        }
-
-        childSessionStates.set(statusSessionId, status.type === 'idle' ? 'idle' : 'busy');
-        if (status.type === 'busy' || status.type === 'retry') {
+          childSessionErrorHints.delete(statusSessionId);
+          childSessionStates.set(statusSessionId, status.type);
           sawBackgroundEvidence = true;
           resetIdleTracking();
+          return;
         }
+
+        childSessionStates.set(statusSessionId, 'unknown');
+        scheduleIdleCheck(0);
       }
     });
 
@@ -1358,6 +1338,7 @@ export async function runPrompt(
       } else {
         sawBackgroundEvidence = true;
         childSessionStates.set(activitySessionId, 'busy');
+        childSessionErrorHints.delete(activitySessionId);
       }
       resetIdleTracking();
     });
@@ -1378,8 +1359,8 @@ export async function runPrompt(
       }
 
       if (childSessionIds.has(errorSessionId) || childSessionStates.has(errorSessionId)) {
-        childTerminalSessionIds.add(errorSessionId);
-        childSessionStates.set(errorSessionId, 'idle');
+        childSessionErrorHints.add(errorSessionId);
+        childSessionStates.set(errorSessionId, 'unknown');
         scheduleIdleCheck(0);
       }
     });

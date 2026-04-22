@@ -54,6 +54,10 @@ export interface MessagePart {
   sessionID: string;
   messageID: string;
   type: string;
+  state?: {
+    status?: 'pending' | 'running' | 'completed' | 'error' | string;
+    [key: string]: unknown;
+  };
   text?: string;
   rawText?: string;
   systemTexts?: string[];
@@ -148,6 +152,11 @@ export interface MessageInfo {
   id: string;
   role?: string;
   type?: string;
+  time?: {
+    completed?: string | number | null;
+    [key: string]: unknown;
+  };
+  error?: unknown;
   [key: string]: unknown;
 }
 

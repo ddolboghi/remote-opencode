@@ -170,6 +170,59 @@ function findStreamEditPayload(
   return payload;
 }
 
+type MockSessionMessage = {
+  info: Record<string, unknown>;
+  parts: Array<Record<string, unknown>>;
+};
+
+function createAssistantMessage(
+  id: string,
+  text: string,
+  options?: {
+    completed?: string | number | null;
+    error?: unknown;
+    parts?: Array<Record<string, unknown>>;
+  },
+): MockSessionMessage {
+  const completed = options?.completed ?? '2026-04-22T00:00:00.000Z';
+  const info: Record<string, unknown> = {
+    id,
+    role: 'assistant',
+  };
+
+  if (completed !== null) {
+    info.time = { completed };
+  }
+
+  if (options?.error !== undefined) {
+    info.error = options.error;
+  }
+
+  return {
+    info,
+    parts: options?.parts ?? [{ type: 'text', text }],
+  };
+}
+
+function setSessionMessageSequencesBySessionId(
+  sessionSequences: Record<string, MockSessionMessage[][]>,
+): void {
+  const callCounts = new Map<string, number>();
+
+  sessionManagerMock.getSessionMessages.mockImplementation(
+    async (_port: number, requestedSessionId: string) => {
+      const sequences = sessionSequences[requestedSessionId];
+      if (!sequences) {
+        return [];
+      }
+
+      const currentIndex = callCounts.get(requestedSessionId) ?? 0;
+      callCounts.set(requestedSessionId, currentIndex + 1);
+      return sequences[Math.min(currentIndex, sequences.length - 1)] ?? [];
+    },
+  );
+}
+
 const dataStoreMock = vi.hoisted(() => ({
   getChannelProjectPath: vi.fn(),
   getWorktreeMapping: vi.fn(),
@@ -261,7 +314,18 @@ describe('executionService messaging and completion handling', () => {
     sessionManagerMock.getSessionStatusMap.mockResolvedValue({
       [sessionId]: { type: 'idle' },
     });
-    sessionManagerMock.getSessionMessages.mockResolvedValue([]);
+    sessionManagerMock.getSessionMessages.mockImplementation(async (_port: number, requestedSessionId: string) => {
+      if (requestedSessionId === sessionId) {
+        return [];
+      }
+
+      return [
+        createAssistantMessage(
+          `msg-${requestedSessionId}`,
+          `Completed child output for ${requestedSessionId}`,
+        ),
+      ];
+    });
     sessionManagerMock.isSessionBusy.mockResolvedValue(false);
     sessionManagerMock.getSseClient.mockReturnValue(undefined);
 
@@ -663,7 +727,10 @@ describe('executionService messaging and completion handling', () => {
       [sessionId]: { type: 'idle' },
       'child-1': { type: 'busy' },
     });
-    sessionManagerMock.getSessionMessages.mockResolvedValue([]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[]],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -717,7 +784,10 @@ describe('executionService messaging and completion handling', () => {
       [sessionId]: { type: 'idle' },
       'child-1': { type: 'busy' },
     });
-    sessionManagerMock.getSessionMessages.mockResolvedValue([]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[]],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -755,7 +825,10 @@ describe('executionService messaging and completion handling', () => {
       [sessionId]: { type: 'idle' },
       'child-1': { type: 'busy' },
     });
-    sessionManagerMock.getSessionMessages.mockResolvedValue([]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[]],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -824,14 +897,13 @@ describe('executionService messaging and completion handling', () => {
         [sessionId]: { type: 'idle' },
         'child-1': { type: 'idle' },
       });
-    sessionManagerMock.getSessionMessages
-      .mockResolvedValueOnce([])
-      .mockResolvedValue([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Final answer after late structured promotion' }],
-        },
-      ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [
+        [],
+        [createAssistantMessage('msg-parent', 'Final answer after late structured promotion')],
+      ],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -903,7 +975,10 @@ describe('executionService messaging and completion handling', () => {
         [sessionId]: { type: 'idle' },
         'child-1': { type: 'idle' },
       });
-    sessionManagerMock.getSessionMessages.mockResolvedValue([]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[]],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -948,12 +1023,10 @@ describe('executionService messaging and completion handling', () => {
         inFlightContent.includes('Generating final response...'),
     ).toBe(true);
 
-    sessionManagerMock.getSessionMessages.mockResolvedValue([
-      {
-        info: { id: 'msg-parent', role: 'assistant' },
-        parts: [{ type: 'text', text: 'Final answer after stale child refresh resolution' }],
-      },
-    ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[createAssistantMessage('msg-parent', 'Final answer after stale child refresh resolution')]],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     client.emitPartUpdated({
       sessionID: sessionId,
@@ -986,13 +1059,12 @@ describe('executionService messaging and completion handling', () => {
       })
       .mockResolvedValue({
         [sessionId]: { type: 'idle' },
+        'child-1': { type: 'idle' },
       });
-    sessionManagerMock.getSessionMessages.mockResolvedValue([
-      {
-        info: { id: 'msg-parent', role: 'assistant' },
-        parts: [{ type: 'text', text: 'Parent text that arrived before child completion' }],
-      },
-    ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[createAssistantMessage('msg-parent', 'Parent text that arrived before child completion')]],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -1031,12 +1103,10 @@ describe('executionService messaging and completion handling', () => {
     expect(sentContents).not.toContain('✅ Done');
     expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
 
-    sessionManagerMock.getSessionMessages.mockResolvedValue([
-      {
-        info: { id: 'msg-parent', role: 'assistant' },
-        parts: [{ type: 'text', text: 'Fresh parent text after child completion' }],
-      },
-    ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[createAssistantMessage('msg-parent', 'Fresh parent text after child completion')]],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     client.emitPartUpdated({
       sessionID: sessionId,
@@ -1064,12 +1134,10 @@ describe('executionService messaging and completion handling', () => {
       [sessionId]: { type: 'idle' },
       'child-1': { type: 'idle' },
     });
-    sessionManagerMock.getSessionMessages.mockResolvedValue([
-      {
-        info: { id: 'msg-before', role: 'assistant' },
-        parts: [{ type: 'text', text: 'Interim parent text before child completion' }],
-      },
-    ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[createAssistantMessage('msg-before', 'Interim parent text before child completion')]],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -1088,6 +1156,98 @@ describe('executionService messaging and completion handling', () => {
     expect(sentContents).not.toContain('??Done');
   });
 
+  it('does not finalize when a child is idle but its last assistant message is incomplete', async () => {
+    sessionManagerMock.getSessionChildren.mockResolvedValue([
+      { id: 'child-1', title: 'Background child' },
+    ]);
+    sessionManagerMock.getSessionStatusMap.mockResolvedValue({
+      [sessionId]: { type: 'idle' },
+      'child-1': { type: 'idle' },
+    });
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[createAssistantMessage('msg-parent', 'Parent final text after background work')]],
+      'child-1': [[createAssistantMessage('msg-child-incomplete', 'Child text still streaming', { completed: null })]],
+    });
+
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitMessagePart({
+      type: 'subtask',
+      sessionID: sessionId,
+      id: 'part-child-incomplete',
+      messageID: 'msg-parent',
+      prompt: 'Background worker',
+      description: 'Incomplete background worker',
+      agent: 'general',
+    });
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
+
+    const activeContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
+    expect(
+      activeContent.includes('Waiting for background agents...') ||
+        activeContent.includes('Generating final response...'),
+    ).toBe(true);
+  });
+
+  it('does not finalize when a child is idle but still has a running tool part', async () => {
+    sessionManagerMock.getSessionChildren.mockResolvedValue([
+      { id: 'child-1', title: 'Background child' },
+    ]);
+    sessionManagerMock.getSessionStatusMap.mockResolvedValue({
+      [sessionId]: { type: 'idle' },
+      'child-1': { type: 'idle' },
+    });
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[createAssistantMessage('msg-parent', 'Parent final text after background work')]],
+      'child-1': [[
+        createAssistantMessage('msg-child-tool-running', 'Child tool still running', {
+          parts: [
+            { type: 'text', text: 'Child tool still running' },
+            { type: 'tool', state: { status: 'running' } },
+          ],
+        }),
+      ]],
+    });
+
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitMessagePart({
+      type: 'subtask',
+      sessionID: sessionId,
+      id: 'part-child-tool-running',
+      messageID: 'msg-parent',
+      prompt: 'Background worker',
+      description: 'Tool-running background worker',
+      agent: 'general',
+    });
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
+    expect(getLastStreamEditPayload(streamEdit)?.content).toContain('Waiting for background agents...');
+  });
+
   it('finalizes after children go idle and the parent final message is confirmed', async () => {
     sessionManagerMock.getSessionChildren.mockResolvedValue([
       { id: 'child-1', title: 'Background child' },
@@ -1096,25 +1256,14 @@ describe('executionService messaging and completion handling', () => {
       [sessionId]: { type: 'idle' },
       'child-1': { type: 'idle' },
     });
-    sessionManagerMock.getSessionMessages
-      .mockResolvedValueOnce([
-        {
-          info: { id: 'msg-before', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Interim parent text before child completion' }],
-        },
-      ])
-      .mockResolvedValueOnce([
-        {
-          info: { id: 'msg-before', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Interim parent text before child completion' }],
-        },
-      ])
-      .mockResolvedValue([
-        {
-          info: { id: 'msg-final', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Final answer from the parent session' }],
-        },
-      ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [
+        [createAssistantMessage('msg-before', 'Interim parent text before child completion')],
+        [createAssistantMessage('msg-before', 'Interim parent text before child completion')],
+        [createAssistantMessage('msg-final', 'Final answer from the parent session')],
+      ],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -1143,25 +1292,14 @@ describe('executionService messaging and completion handling', () => {
       [sessionId]: { type: 'idle' },
       'child-1': { type: 'idle' },
     });
-    sessionManagerMock.getSessionMessages
-      .mockResolvedValueOnce([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Interim parent text before child completion' }],
-        },
-      ])
-      .mockResolvedValueOnce([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Interim parent text before child completion' }],
-        },
-      ])
-      .mockResolvedValue([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Final answer from the same parent message' }],
-        },
-      ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [
+        [createAssistantMessage('msg-parent', 'Interim parent text before child completion')],
+        [createAssistantMessage('msg-parent', 'Interim parent text before child completion')],
+        [createAssistantMessage('msg-parent', 'Final answer from the same parent message')],
+      ],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -1195,12 +1333,10 @@ describe('executionService messaging and completion handling', () => {
       [sessionId]: { type: 'idle' },
       'child-1': { type: 'idle' },
     });
-    sessionManagerMock.getSessionMessages.mockResolvedValue([
-      {
-        info: { id: 'msg-before', role: 'assistant' },
-        parts: [{ type: 'text', text: 'Interim parent text before child completion' }],
-      },
-    ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[createAssistantMessage('msg-before', 'Interim parent text before child completion')]],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -1251,19 +1387,13 @@ describe('executionService messaging and completion handling', () => {
         [sessionId]: { type: 'idle' },
         'child-1': { type: 'idle' },
       });
-    sessionManagerMock.getSessionMessages
-      .mockResolvedValueOnce([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Interim parent text before child completion' }],
-        },
-      ])
-      .mockResolvedValue([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Final answer after background work' }],
-        },
-      ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [
+        [createAssistantMessage('msg-parent', 'Interim parent text before child completion')],
+        [createAssistantMessage('msg-parent', 'Final answer after background work')],
+      ],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -1301,10 +1431,10 @@ describe('executionService messaging and completion handling', () => {
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
 
-  it('finalizes when completed children disappear from the status map after the parent final message arrives', async () => {
-    sessionManagerMock.getSessionChildren.mockResolvedValue([
-      { id: 'child-1', title: 'Background child' },
-    ]);
+  it('does not finalize when a child disappears from children and status before any terminal child message is seen', async () => {
+    sessionManagerMock.getSessionChildren
+      .mockResolvedValueOnce([{ id: 'child-1', title: 'Background child' }])
+      .mockResolvedValue([]);
     sessionManagerMock.getSessionStatusMap
       .mockResolvedValueOnce({
         [sessionId]: { type: 'idle' },
@@ -1313,19 +1443,10 @@ describe('executionService messaging and completion handling', () => {
       .mockResolvedValue({
         [sessionId]: { type: 'idle' },
       });
-    sessionManagerMock.getSessionMessages
-      .mockResolvedValueOnce([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Interim parent text before child completion' }],
-        },
-      ])
-      .mockResolvedValue([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Final answer after child completion' }],
-        },
-      ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[createAssistantMessage('msg-parent', 'Final answer while child metadata vanished')]],
+      'child-1': [[]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -1346,10 +1467,10 @@ describe('executionService messaging and completion handling', () => {
     client.emitPartUpdated({
       sessionID: sessionId,
       messageID: 'msg-parent',
-      text: 'Final answer after child completion',
+      text: 'Final answer while child metadata vanished',
     });
 
-    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(1600);
     await vi.advanceTimersByTimeAsync(5000);
     await vi.advanceTimersByTimeAsync(0);
 
@@ -1357,11 +1478,87 @@ describe('executionService messaging and completion handling', () => {
       .slice(1)
       .map(([payload]) => payload.content as string);
 
-    expect(sentContents.some((content) => content.includes('Done'))).toBe(true);
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sentContents).not.toContain('⚠️ Done (no output received)');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
+
+    const latestContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
+    expect(latestContent).toContain('Waiting for background agents...');
+  });
+
+  it('finalizes after a child disappears from children and status once terminal success was already observed', async () => {
+    sessionManagerMock.getSessionChildren
+      .mockResolvedValueOnce([{ id: 'child-1', title: 'Background child' }])
+      .mockResolvedValueOnce([{ id: 'child-1', title: 'Background child' }])
+      .mockResolvedValue([]);
+    sessionManagerMock.getSessionStatusMap
+      .mockResolvedValueOnce({
+        [sessionId]: { type: 'idle' },
+        'child-1': { type: 'busy' },
+      })
+      .mockResolvedValueOnce({
+        [sessionId]: { type: 'idle' },
+        'child-1': { type: 'idle' },
+      })
+      .mockResolvedValue({
+        [sessionId]: { type: 'idle' },
+      });
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [
+        [createAssistantMessage('msg-parent', 'Interim parent text before cached child success')],
+        [createAssistantMessage('msg-parent', 'Interim parent text before cached child success')],
+        [createAssistantMessage('msg-parent', 'Final answer after cached child success')],
+      ],
+      'child-1': [[createAssistantMessage('msg-child-1', 'Completed child output for child-1')]],
+    });
+
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitMessagePart({
+      type: 'subtask',
+      sessionID: sessionId,
+      id: 'part-4',
+      messageID: 'msg-parent',
+      prompt: 'Investigate API behavior',
+      description: 'Background worker',
+      agent: 'general',
+    });
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-parent',
+      text: 'Final answer after cached child success',
+    });
+
+    await vi.advanceTimersByTimeAsync(1600);
+    await vi.advanceTimersByTimeAsync(0);
+
+    let sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).not.toContain('✅ Done');
+
+    const midContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
+    expect(midContent).toContain('Generating final response...');
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).toContain('✅ Done');
 
     const finalEdit = getLastStreamEditPayload(streamEdit);
-    expect(finalEdit?.content).toContain('Final answer after child completion');
+    expect(finalEdit?.content).toContain('Final answer after cached child success');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+    expect(sessionManagerMock.clearSseClient).toHaveBeenCalledWith(threadId);
   });
 
   it('shows waiting for background agents when subtask evidence exists and completion has not been observed', async () => {
@@ -1393,7 +1590,14 @@ describe('executionService messaging and completion handling', () => {
     expect(sentContents).not.toContain('??Done');
   });
 
-  it('switches to generating final response after background completion without marking done', async () => {
+  it('does not mark the run done when a background completion reminder arrives with only empty child and status snapshots', async () => {
+    sessionManagerMock.getSessionChildren
+      .mockResolvedValueOnce([{ id: 'child-1', title: 'Background child' }])
+      .mockResolvedValue([]);
+    sessionManagerMock.getSessionStatusMap.mockResolvedValue({
+      [sessionId]: { type: 'idle' },
+    });
+
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
     const client = sseHarness.MockSSEClient.instances[0];
@@ -1412,19 +1616,22 @@ describe('executionService messaging and completion handling', () => {
     client.emitSessionIdle(sessionId);
     await vi.advanceTimersByTimeAsync(1000);
     client.emitBackgroundTaskCompleted(sessionId);
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(0);
 
     const latestContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
-    expect(latestContent).toContain('Generating final response...');
+    expect(latestContent).toContain('Waiting for background agents...');
 
     const sentContents = channelSend.mock.calls
       .slice(1)
       .map(([payload]) => payload.content as string);
 
-    expect(sentContents).not.toContain('??Done');
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sentContents).not.toContain('⚠️ Done (no output received)');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
   });
 
-  it('keeps Discord send/edit flow alive across repeated background-task phases in one run', async () => {
+  it('keeps Discord send/edit flow alive across repeated untracked background-task phases in one run', async () => {
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
     const client = sseHarness.MockSSEClient.instances[0];
@@ -1451,12 +1658,17 @@ describe('executionService messaging and completion handling', () => {
     client.emitBackgroundTaskCompleted(sessionId);
     await vi.advanceTimersByTimeAsync(1000);
 
-    expect(getLastStreamEditPayload(streamEdit)?.content).toContain('Generating final response...');
+    const firstReminderContent = getLastStreamEditPayload(streamEdit)?.content ?? '';
+    expect(
+      firstReminderContent.includes('Waiting for background agents...') ||
+        firstReminderContent.includes('Generating final response...'),
+    ).toBe(true);
 
-    const firstGeneratingIndex = editContents().findIndex((content) =>
+    const firstReminderIndex = editContents().findIndex((content) =>
+      content.includes('Waiting for background agents...') ||
       content.includes('Generating final response...'),
     );
-    expect(firstGeneratingIndex).toBeGreaterThanOrEqual(0);
+    expect(firstReminderIndex).toBeGreaterThanOrEqual(0);
 
     client.emitMessagePart({
       type: 'subtask',
@@ -1473,20 +1685,16 @@ describe('executionService messaging and completion handling', () => {
     client.emitSessionIdle(sessionId);
     await vi.advanceTimersByTimeAsync(1000);
 
-    const secondWaitingIndex = editContents().findIndex(
-      (content, index) =>
-        index > firstGeneratingIndex && content.includes('Waiting for background agents...'),
-    );
-    expect(secondWaitingIndex).toBeGreaterThan(firstGeneratingIndex);
-
     client.emitBackgroundTaskCompleted(sessionId);
     await vi.advanceTimersByTimeAsync(1000);
 
-    const secondGeneratingIndex = editContents().findIndex(
-      (content, index) =>
-        index > secondWaitingIndex && content.includes('Generating final response...'),
-    );
-    expect(secondGeneratingIndex).toBeGreaterThan(secondWaitingIndex);
+    const interimContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(interimContents).not.toContain('✅ Done');
+    expect(interimContents).not.toContain('⚠️ Done (no output received)');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
 
     client.emitPartUpdated({
       sessionID: sessionId,
@@ -1504,15 +1712,15 @@ describe('executionService messaging and completion handling', () => {
       .slice(1)
       .map(([payload]) => payload.content as string);
 
-    expect(sentContents).toContain('✅ Done');
-    expect(sentContents.indexOf('✅ Done')).toBe(sentContents.length - 1);
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
 
-    const finalEdit = getLastStreamEditPayload(streamEdit);
-    expect(finalEdit?.content).toContain('Final answer after multiple background phases');
-    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+    const activeEdit = getLastStreamEditPayload(streamEdit);
+    expect(activeEdit?.content).toContain('Final answer after multiple background phases');
+    expect(activeEdit?.components?.[0]?.components?.[0]?.data?.disabled).not.toBe(true);
   });
 
-  it('does not mark the run done from the first resumed parent text alone when background work has no tracked child session', async () => {
+  it('does not mark the run done from resumed parent text when background work has no tracked child session', async () => {
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
     const client = sseHarness.MockSSEClient.instances[0];
@@ -1562,14 +1770,15 @@ describe('executionService messaging and completion handling', () => {
       .slice(1)
       .map(([payload]) => payload.content as string);
 
-    expect(sentContents).toContain('✅ Done');
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
 
-    const finalEdit = getLastStreamEditPayload(streamEdit);
-    expect(finalEdit?.content).toContain('Final parent reply after background task');
-    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+    const activeEdit = getLastStreamEditPayload(streamEdit);
+    expect(activeEdit?.content).toContain('Final parent reply after background task');
+    expect(activeEdit?.components?.[0]?.components?.[0]?.data?.disabled).not.toBe(true);
   });
 
-  it('finalizes a single weak-background final reply without letting stale parent snapshots overwrite newer SSE text', async () => {
+  it('does not finalize a weak-background final reply without structural child confirmation', async () => {
     sessionManagerMock.getSessionMessages.mockResolvedValue([
       {
         info: { id: 'msg-weak-background-final', role: 'assistant' },
@@ -1615,14 +1824,15 @@ describe('executionService messaging and completion handling', () => {
       .slice(1)
       .map(([payload]) => payload.content as string);
 
-    expect(sentContents).toContain('✅ Done');
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
 
-    const finalEdit = getLastStreamEditPayload(streamEdit);
-    expect(finalEdit?.content).toContain('Final parent reply after a weak background phase');
-    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+    const activeEdit = getLastStreamEditPayload(streamEdit);
+    expect(activeEdit?.content).toContain('Final parent reply after a weak background phase');
+    expect(activeEdit?.components?.[0]?.components?.[0]?.data?.disabled).not.toBe(true);
   });
 
-  it('finalizes when final visible text arrives after waiting with background evidence even without a step_finish event', async () => {
+  it('does not finalize from structured background evidence alone when no child session is ever discovered', async () => {
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
     const client = sseHarness.MockSSEClient.instances[0];
@@ -1657,14 +1867,15 @@ describe('executionService messaging and completion handling', () => {
       .slice(1)
       .map(([payload]) => payload.content as string);
 
-    expect(sentContents).toContain('✅ Done');
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
 
-    const finalEdit = getLastStreamEditPayload(streamEdit);
-    expect(finalEdit?.content).toContain('Final answer from the main agent');
-    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+    const activeEdit = getLastStreamEditPayload(streamEdit);
+    expect(activeEdit?.content).toContain('Final answer from the main agent');
+    expect(activeEdit?.components?.[0]?.components?.[0]?.data?.disabled).not.toBe(true);
   });
 
-  it('does not stay stuck forever when busy-state checks remain unknown after the final visible text', async () => {
+  it('does not finalize while busy-state checks remain unknown for weak background evidence', async () => {
     sessionManagerMock.getSessionStatusMap.mockReset();
     sessionManagerMock.getSessionStatusMap.mockResolvedValue({});
     sessionManagerMock.getSessionBusyState.mockReset();
@@ -1702,7 +1913,8 @@ describe('executionService messaging and completion handling', () => {
       .slice(1)
       .map(([payload]) => payload.content as string);
 
-    expect(sentContents).toContain('✅ Done');
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
   });
 
   it('re-checks a stale busy cache against live session state before deciding to stay running', async () => {
@@ -1745,19 +1957,17 @@ describe('executionService messaging and completion handling', () => {
       [sessionId]: { type: 'idle' },
       'child-1': { type: 'busy' },
     });
-    sessionManagerMock.getSessionMessages
-      .mockResolvedValueOnce([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Interim parent text before child failure' }],
-        },
-      ])
-      .mockResolvedValue([
-        {
-          info: { id: 'msg-parent', role: 'assistant' },
-          parts: [{ type: 'text', text: 'Final answer after child failure' }],
-        },
-      ]);
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [
+        [createAssistantMessage('msg-parent', 'Interim parent text before child failure')],
+        [createAssistantMessage('msg-parent', 'Final answer after child failure')],
+      ],
+      'child-1': [[
+        createAssistantMessage('msg-child-1', 'Background worker failed', {
+          error: { name: 'UnknownError', message: 'Background worker failed' },
+        }),
+      ]],
+    });
 
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
@@ -1801,6 +2011,80 @@ describe('executionService messaging and completion handling', () => {
     const finalEdit = getLastStreamEditPayload(streamEdit);
     expect(finalEdit?.content).toContain('Final answer after child failure');
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+  });
+
+  it('treats terminal_error as terminal for one child while still waiting for other busy children', async () => {
+    sessionManagerMock.getSessionChildren.mockResolvedValue([
+      { id: 'child-1', title: 'Failed child' },
+      { id: 'child-2', title: 'Still busy child' },
+    ]);
+    sessionManagerMock.getSessionStatusMap
+      .mockResolvedValueOnce({
+        [sessionId]: { type: 'idle' },
+        'child-1': { type: 'busy' },
+        'child-2': { type: 'busy' },
+      })
+      .mockResolvedValue({
+        [sessionId]: { type: 'idle' },
+        'child-2': { type: 'busy' },
+      });
+    setSessionMessageSequencesBySessionId({
+      [sessionId]: [[createAssistantMessage('msg-parent', 'Parent final text while another child is still busy')]],
+      'child-1': [[
+        createAssistantMessage('msg-child-1', 'Child one failed', {
+          error: { name: 'UnknownError', message: 'Child one failed' },
+        }),
+      ]],
+      'child-2': [[]],
+    });
+
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitMessagePart({
+      type: 'subtask',
+      sessionID: sessionId,
+      id: 'part-child-error-terminal',
+      messageID: 'msg-parent',
+      prompt: 'Investigate API behavior',
+      description: 'Background worker 1',
+      agent: 'general',
+    });
+    client.emitMessagePart({
+      type: 'subtask',
+      sessionID: sessionId,
+      id: 'part-child-busy',
+      messageID: 'msg-parent',
+      prompt: 'Investigate follow-up behavior',
+      description: 'Background worker 2',
+      agent: 'general',
+    });
+
+    client.emitSessionIdle(sessionId);
+    await vi.advanceTimersByTimeAsync(3000);
+
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-parent',
+      text: 'Parent final text while another child is still busy',
+    });
+
+    await vi.advanceTimersByTimeAsync(1600);
+    client.emitSessionError('child-1', {
+      name: 'UnknownError',
+      data: { message: 'Child one failed' },
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sentContents).not.toContain('⚠️ Done (no output received)');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
+    expect(getLastStreamEditPayload(streamEdit)?.content).toContain('Waiting for background agents...');
   });
 
   it('forces the visible stream message into an interrupted terminal state', async () => {
