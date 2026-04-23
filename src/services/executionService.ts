@@ -319,20 +319,22 @@ export async function runPrompt(
     }
   };
 
-  const buildLivePreviewBody = (): string | undefined => {
+  const buildPreviewBody = (statusLine: string): string | undefined => {
     const visibleText = accumulatedText.trim();
     if (!visibleText) {
       return undefined;
     }
 
     const previewPrefix = '…\n';
-    const previewBudget = getContentBudget(`${contextHeader}\n\n${getActiveStatusLine()}\n\n${previewPrefix}`);
+    const previewBudget = getContentBudget(`${contextHeader}\n\n${statusLine}\n\n${previewPrefix}`);
     if (visibleText.length <= previewBudget) {
       return visibleText;
     }
 
     return `${previewPrefix}${visibleText.slice(-(previewBudget - previewPrefix.length))}`;
   };
+
+  const buildLivePreviewBody = (): string | undefined => buildPreviewBody(getActiveStatusLine());
 
   const renderRepresentativePreview = async (): Promise<void> => {
     if (isFinalized) {
@@ -501,7 +503,11 @@ export async function runPrompt(
     clearRuntimeArtifacts();
 
     const settledOriginalMessage = await settleTerminalStreamMessage(
-      buildStatusContent(contextHeader, '⏹️ Interrupted.'),
+      buildTerminalContent(
+        contextHeader,
+        '⏹️ Interrupted.',
+        buildPreviewBody('⏹️ Interrupted.'),
+      ),
       '⏹️ Interrupted.',
     );
     if (settledOriginalMessage.kind === 'failed') {

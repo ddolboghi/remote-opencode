@@ -2173,6 +2173,27 @@ describe('executionService messaging and completion handling', () => {
     expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
   });
 
+  it('preserves the visible transcript preview when interrupt settles the representative message', async () => {
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-interrupt-preview',
+      text: 'Visible transcript before interrupt '.repeat(40),
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const interrupted = await interruptActiveRun(threadId);
+    expect(interrupted).toBe(true);
+
+    const finalEdit = getLastStreamEditPayload(streamEdit);
+    expect(finalEdit?.content).toContain('⏹️ Interrupted.');
+    expect(finalEdit?.content).toContain('Visible transcript before interrupt');
+    expect(finalEdit?.components?.[0]?.components?.[0]?.data?.disabled).toBe(true);
+  });
+
   it('does not let a queued stream tick overwrite the interrupted terminal state', async () => {
     await runPrompt(channel as any, threadId, prompt, parentChannelId);
 
