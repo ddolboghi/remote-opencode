@@ -1145,17 +1145,25 @@ export async function runPrompt(
         if (busyState === 'unknown' && !isFinalized) {
           unknownBusyChecks += 1;
 
-          if ((sawCompletionSignal || canForceFinalizeAfterUnknownBusy()) && unknownBusyChecks >= MAX_UNKNOWN_BUSY_CHECKS) {
-            if (!sawCompletionSignal) {
-              logFallbackFinalize('stable_visible_text_after_unknown_busy_checks');
+          if (sawTrackedChildSessions) {
+            if (anyChildBusy() || anyChildUnknown()) {
+              setPhase('waiting_children');
+              scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
+              return;
             }
-            setPhase('finalizing');
-            await finalize();
+          } else {
+            if ((sawCompletionSignal || canForceFinalizeAfterUnknownBusy()) && unknownBusyChecks >= MAX_UNKNOWN_BUSY_CHECKS) {
+              if (!sawCompletionSignal) {
+                logFallbackFinalize('stable_visible_text_after_unknown_busy_checks');
+              }
+              setPhase('finalizing');
+              await finalize();
+              return;
+            }
+
+            scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
             return;
           }
-
-          scheduleIdleCheck(IDLE_POLL_INTERVAL_MS);
-          return;
         }
 
         unknownBusyChecks = 0;

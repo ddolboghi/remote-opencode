@@ -1917,6 +1917,65 @@ describe('executionService messaging and completion handling', () => {
     expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
   });
 
+  it('does not finalize from unknown parent status while a tracked child remains in retry', async () => {
+    sessionManagerMock.getSessionChildren.mockResolvedValue([
+      { id: 'child-1', title: 'Background child' },
+    ]);
+    sessionManagerMock.getSessionStatusMap.mockReset();
+    sessionManagerMock.getSessionStatusMap.mockResolvedValue({
+      'child-1': {
+        type: 'retry',
+        attempt: 1,
+        message: 'Retrying background worker',
+        next: '2026-04-23T00:46:10.921Z',
+      },
+    });
+    sessionManagerMock.getSessionBusyState.mockReset();
+    sessionManagerMock.getSessionBusyState.mockResolvedValue('unknown');
+
+    await runPrompt(channel as any, threadId, prompt, parentChannelId);
+
+    const client = sseHarness.MockSSEClient.instances[0];
+    client.emitMessagePart({
+      type: 'subtask',
+      sessionID: sessionId,
+      id: 'part-child-retry',
+      messageID: 'msg-parent',
+      prompt: 'Background worker',
+      description: 'Retrying background worker',
+      agent: 'general',
+    });
+
+    await Promise.resolve();
+
+    client.emitPartUpdated({
+      sessionID: sessionId,
+      messageID: 'msg-parent',
+      text: 'Final answer while the child is still retrying',
+    });
+
+    await vi.advanceTimersByTimeAsync(1600);
+
+    client.emitCompletion(sessionId);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sentContents = channelSend.mock.calls
+      .slice(1)
+      .map(([payload]) => payload.content as string);
+
+    expect(sentContents).not.toContain('✅ Done');
+    expect(sessionManagerMock.clearSseClient).not.toHaveBeenCalledWith(threadId);
+
+    const activeEdit = getLastStreamEditPayload(streamEdit);
+    expect(activeEdit?.content).toContain('Waiting for background agents...');
+    expect(activeEdit?.content).toContain('Final answer while the child is still retrying');
+    expect(activeEdit?.components?.[0]?.components?.[0]?.data?.disabled).not.toBe(true);
+  });
+
   it('re-checks a stale busy cache against live session state before deciding to stay running', async () => {
     sessionManagerMock.getSessionStatusMap.mockReset();
     sessionManagerMock.getSessionStatusMap.mockResolvedValue({});
